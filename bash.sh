@@ -1565,3 +1565,422 @@ EOF
 setup_performance_monitoring() {
     log "Konfiguracja monitorowania wydajności..."
 
+# Kontynuacja konfiguracji monitorowania wydajności
+setup_performance_monitoring() {
+    log "Konfiguracja monitorowania wydajności..."
+    
+    # Konfiguracja Telegraf dla zbierania metryk systemowych
+    cat > $MONITORING_DIR/telegraf/telegraf.conf <<EOF
+[global_tags]
+  environment = "production"
+  service = "ghost"
+
+[agent]
+  interval = "10s"
+  round_interval = true
+  metric_batch_size = 1000
+  metric_buffer_limit = 10000
+  collection_jitter = "0s"
+  flush_interval = "10s"
+  flush_jitter = "0s"
+  precision = ""
+  hostname = "$DOMAIN"
+  omit_hostname = false
+
+[[outputs.prometheus_client]]
+  listen = ":9273"
+  metric_version = 2
+  expiration_interval = "60s"
+
+[[inputs.cpu]]
+  percpu = true
+  totalcpu = true
+  collect_cpu_time = false
+  report_active = false
+
+[[inputs.disk]]
+  ignore_fs = ["tmpfs", "devtmpfs", "devfs", "iso9660", "overlay", "aufs", "squashfs"]
+
+[[inputs.diskio]]
+
+[[inputs.kernel]]
+
+[[inputs.mem]]
+
+[[inputs.processes]]
+
+[[inputs.swap]]
+
+[[inputs.system]]
+
+[[inputs.docker]]
+  endpoint = "unix:///var/run/docker.sock"
+  container_names = []
+  timeout = "5s"
+  perdevice = true
+  total = false
+
+[[inputs.net]]
+  interfaces = ["eth*", "enp*", "ens*"]
+  ignore_protocol_stats = false
+
+[[inputs.nginx]]
+  urls = ["http://localhost/nginx_status"]
+  response_timeout = "5s"
+
+[[inputs.mysql]]
+  servers = ["${DB_USER}:${MYSQL_PASSWORD}@tcp(db:3306)/${DB_NAME}"]
+  metric_version = 2
+
+[[inputs.redis]]
+  servers = ["tcp://redis:6379"]
+  password = "${REDIS_PASSWORD}"
+EOF
+
+    # Konfiguracja własnych dashboardów dla Grafany
+    cat > $MONITORING_DIR/grafana/dashboards/performance.json <<EOF
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "calcs": ["mean", "max", "min"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "100 - (avg by (instance) (irate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+          "legendFormat": "CPU Usage",
+          "refId": "A"
+        }
+      ],
+      "title": "CPU Usage",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": ["mean", "max", "min"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "100 * (1 - ((node_memory_MemAvailable_bytes or node_memory_Available_bytes) / node_memory_MemTotal_bytes))",
+          "legendFormat": "Memory Usage",
+          "refId": "A"
+        }
+      ],
+      "title": "Memory Usage",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": [],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Ghost Performance Dashboard",
+  "uid": "ghost_performance",
+  "version": 1,
+  "weekStart": ""
+}
+EOF
+
+    # Konfiguracja alertów wydajnościowych
+    cat > $MONITORING_DIR/prometheus/rules/performance_alerts.yml <<EOF
+groups:
+- name: performance_alerts
+  rules:
+  - alert: HighCPUUsage
+    expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: High CPU usage (instance {{ \$labels.instance }})
+      description: CPU usage is above 80%
+      
+  - alert: HighMemoryUsage
+    expr: 100 * (1 - ((node_memory_MemAvailable_bytes or node_memory_Available_bytes) / node_memory_MemTotal_bytes)) > 80
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: High memory usage (instance {{ \$labels.instance }})
+      description: Memory usage is above 80%
+      
+  - alert: HighDiskUsage
+    expr: 100 - ((node_filesystem_avail_bytes * 100) / node_filesystem_size_bytes) > 80
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: High disk usage (instance {{ \$labels.instance }})
+      description: Disk usage is above 80%
+
+  - alert: SlowResponseTime
+    expr: rate(http_request_duration_seconds_sum[5m]) / rate(http_request_duration_seconds_count[5m]) > 1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: Slow response time (instance {{ \$labels.instance }})
+      description: Average response time is above 1 second
+EOF
+}
+
+# Główna funkcja instalacyjna
+main() {
+    log "Rozpoczęcie instalacji Ghost z rozszerzonymi zabezpieczeniami..."
+    
+    # Sprawdzenie wymagań systemowych
+    check_system_requirements
+    
+    # Sprawdzenie zajętych portów
+    check_ports
+    
+    # Generowanie danych dostępowych
+    generate_secure_credentials
+    
+    # Tworzenie katalogów
+    mkdir -p $INSTALL_DIR/{logs,config,backup,scripts}
+    mkdir -p $MONITORING_DIR/{grafana,prometheus,loki,telegraf}
+    mkdir -p $LOG_DIR
+    
+    # Konfiguracja komponentów
+    setup_nginx
+    setup_grafana
+    setup_prometheus
+    setup_loki
+    setup_docker_compose
+    setup_backup_system
+    setup_auto_updates
+    setup_log_rotation
+    setup_security_monitoring
+    setup_performance_monitoring
+    
+    # Uruchomienie kontenerów
+    cd $INSTALL_DIR
+    docker-compose up -d
+    
+    # Sprawdzenie statusu
+    check_services_status
+    
+    # Konfiguracja firewall
+    setup_firewall
+    
+    # Finalne sprawozdanie
+    log "Instalacja zakończona pomyślnie!"
+    log "Ghost jest dostępny pod adresem: https://$DOMAIN"
+    log "Panel administracyjny: https://$DOMAIN/ghost"
+    log "Grafana: https://$DOMAIN:$GRAFANA_PORT"
+    log "Prometheus: https://$DOMAIN:$PROMETHEUS_PORT"
+    log "Loki: https://$DOMAIN:$LOKI_PORT"
+    log "Dane dostępowe znajdują się w: $CREDENTIALS_FILE"
+    log "WAŻNE: Wykonaj kopię pliku credentials.txt i przechowuj ją w bezpiecznym miejscu!"
+    
+    # Zapisanie podsumowania instalacji
+    cat > "$INSTALL_DIR/installation_summary.txt" <<EOF
+Ghost Installation Summary
+========================
+Date: $(date)
+Domain: $DOMAIN
+Version: $(docker inspect ghost:latest | jq -r '.[0].Config.Labels["org.opencontainers.image.version"]')
+
+Services:
+- Ghost: https://$DOMAIN
+- Admin Panel: https://$DOMAIN/ghost
+- Grafana: https://$DOMAIN:$GRAFANA_PORT
+- Prometheus: https://$DOMAIN:$PROMETHEUS_PORT
+- Loki: https://$DOMAIN:$LOKI_PORT
+
+Backup Schedule:
+- Full backup: Daily at 3:00 AM
+- Incremental backup: Every 6 hours
+
+Security Features:
+- SSL/TLS with auto-renewal
+- Fail2ban protection
+- Network isolation
+- Rate limiting
+- Security monitoring
+- Automated updates
+
+Performance Monitoring:
+- CPU, Memory, Disk usage
+- Database metrics
+- Application metrics
+- Custom alerts
+
+For complete documentation and troubleshooting guide,
+please refer to the documentation in $INSTALL_DIR/docs/
+EOF
+
+    chmod 600 "$INSTALL_DIR/installation_summary.txt"
+}
+
+# Uruchomienie głównej funkcji z obsługą błędów
+{
+    if ! mkdir /var/lock/ghost_install.lock 2>/dev/null; then
+        error "Proces instalacji jest już uruchomiony"
+        exit 1
+    fi
+    
+    trap 'rm -rf /var/lock/ghost_install.lock' EXIT
+    
+    main
+} 2>&1 | tee -a $SCRIPT_LOG
