@@ -1,1323 +1,1294 @@
-#!/bin/bash
+# Funkcje pomocnicze dla zarządzania Ghost
 
-# Kolory do lepszej czytelności
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-# Katalogi instalacji
-INSTALL_DIR="/opt/ghost"
-BACKUP_DIR="/opt/ghost/backup"
-LOG_DIR="/var/log/ghost"
-MONITORING_DIR="/opt/monitoring"
-SCRIPT_LOG="/var/log/ghost-install.log"
-CREDENTIALS_FILE="/root/.ghost_credentials/credentials.txt"
-
-# Funkcja generowania losowego portu
-generate_random_port() {
-    local min_port=10000
-    local max_port=65535
-    local port
-    local used_ports=()
-
-    # Zbierz wszystkie używane porty
-    while IFS= read -r line; do
-        used_ports+=($line)
-    done < <(netstat -tuln | grep "LISTEN" | awk '{print $4}' | awk -F: '{print $NF}')
+# Funkcja aktualizacji Ghost
+update_ghost() {
+    log "INFO" "Rozpoczęcie aktualizacji Ghost..."
     
-    while true; do
-        # Generuj losowy port
-        port=$(shuf -i $min_port-$max_port -n 1)
-        
-        # Sprawdź czy port nie jest już używany
-        if [[ ! " ${used_ports[@]} " =~ " ${port} " ]]; then
-            # Dodatkowe sprawdzenie netstat
-            if ! netstat -tuln | grep -q ":$port "; then
-                echo $port
-                return 0
+    # Utworzenie backupu przed aktualizacją
+    /usr/local/bin/ghost-backup.sh || {
+        log "ERROR" "Nie można utworzyć backupu przed aktualizacją"
+        return 1
+    }
+    
+    # Pobranie aktualnej wersji
+    local current_version
+    current_version=$(cd "$GHOST_DIR" && npm list ghost | grep ghost@ | cut -d'@' -f2)
+    
+    # Pobranie najnowszej wersji
+    local latest_version
+    latest_version=$(curl -s https://api.github.com/repos/TryGhost/Ghost/releases/latest | grep tag_name | cut -d '"' -f 4)
+    
+    if [[ "$current_version" == "$latest_version" ]]; then
+        log "INFO" "Ghost jest aktualny (wersja ${current_version})"
+        return 0
+    fi
+    
+    log "INFO" "Aktualizacja Ghost z wersji ${current_version} do ${latest_version}"
+    
+    # Zatrzymanie Ghost
+    systemctl stop ghost
+    
+    # Aktualizacja
+    cd "$GHOST_DIR" || exit 1
+    npm install ghost@latest --save
+    
+    # Uruchomienie Ghost
+    systemctl start ghost
+    
+    # Weryfikacja
+    local timeout=30
+    local counter=0
+    while ! curl -s http://localhost:2368 > /dev/null; do
+        sleep 1
+        counter=$((counter + 1))
+        if ((counter >= timeout)); then
+            log "ERROR" "Timeout podczas uruchamiania Ghost po aktualizacji"
+            return 1
+        fi
+    done
+    
+    log "INFO" "Aktualizacja zakończona pomyślnie"
+    return 0
+}
+
+# Funkcja zarządzania certyfikatami SSL
+manage_ssl() {
+    local command="$1"
+    local domain="${2:-$DOMAIN}"
+    
+    case "$command" in
+        "renew")
+            log "INFO" "Odnawianie certyfikatu SSL dla $domain"
+            certbot renew --nginx --domain "$domain"
+            ;;
+        "create")
+            log "INFO" "Tworzenie nowego certyfikatu SSL dla $domain"
+            certbot --nginx --domain "$domain" --agree-tos --email "$ADMIN_EMAIL" -n
+            ;;
+        "status")
+            local cert_path="/etc/letsencrypt/live/${domain}/fullchain.pem"
+            if [[ -f "$cert_path" ]]; then
+                openssl x509 -in "$cert_path" -text -noout
+            else
+                log "ERROR" "Nie znaleziono certyfikatu dla $domain"
+                return 1
             fi
+            ;;
+        *)
+            log "ERROR" "Nieznane polecenie: $command"
+            echo "Dostępne polecenia: renew, create, status"
+            return 1
+            ;;
+    esac
+}
+
+# Funkcja czyszczenia systemu
+cleanup_system() {
+    log "INFO" "Rozpoczęcie czyszczenia systemu..."
+    
+    # Czyszczenie logów
+    find /var/log -type f -name "*.gz" -delete
+    find /var/log -type f -name "*.old" -delete
+    
+    # Czyszczenie cache
+    apt-get clean
+    apt-get autoremove -y
+    
+    # Czyszczenie starych backupów
+    find "$BACKUP_DIR" -type f -mtime +30 -delete
+    
+    # Czyszczenie nieużywanych obrazów Dockera (jeśli zainstalowany)
+    if command -v docker >/dev/null 2>&1; then
+        docker system prune -af
+    fi
+    
+    # Czyszczenie pamięci podręcznej npm
+    npm cache clean --force
+    
+    # Czyszczenie temporary files
+    find /tmp -type f -atime +10 -delete
+    find "$TEMP_DIR" -type f -mtime +1 -delete
+    
+    log "INFO" "Czyszczenie systemu zakończone"
+}
+
+# Funkcja diagnostyczna
+diagnose_system() {
+    log "INFO" "Rozpoczęcie diagnostyki systemu..."
+    
+    local report_file="/tmp/ghost_diagnostic_$(date +%Y%m%d_%H%M%S).txt"
+    
+    {
+        echo "=== Ghost Diagnostic Report ==="
+        echo "Date: $(date)"
+        echo "Hostname: $(hostname)"
+        echo
+        
+        echo "=== System Information ==="
+        uname -a
+        echo
+        
+        echo "=== Memory Usage ==="
+        free -h
+        echo
+        
+        echo "=== Disk Usage ==="
+        df -h
+        echo
+        
+        echo "=== Process List ==="
+        ps aux | grep -E 'ghost|nginx|mysql|node'
+        echo
+        
+        echo "=== Ghost Status ==="
+        systemctl status ghost
+        echo
+        
+        echo "=== Nginx Status ==="
+        systemctl status nginx
+        echo
+        
+        echo "=== MySQL Status ==="
+        systemctl status mysql
+        echo
+        
+        echo "=== Recent Logs ==="
+        echo "--- Ghost Logs ---"
+        tail -n 50 /var/log/ghost/application.log
+        echo
+        
+        echo "--- Nginx Error Logs ---"
+        tail -n 50 /var/log/nginx/error.log
+        echo
+        
+        echo "--- MySQL Error Logs ---"
+        tail -n 50 /var/log/mysql/error.log
+        echo
+        
+        echo "=== Security Checks ==="
+        echo "--- Failed SSH Attempts ---"
+        grep "Failed password" /var/log/auth.log | tail -n 10
+        echo
+        
+        echo "--- Fail2ban Status ---"
+        fail2ban-client status
+        echo
+        
+        echo "=== Network Information ==="
+        netstat -tulpn
+        echo
+        
+        echo "=== Certificate Information ==="
+        openssl x509 -in "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" -text -noout 2>/dev/null
+        
+    } > "$report_file"
+    
+    log "INFO" "Raport diagnostyczny zapisany w $report_file"
+    
+    # Wysyłanie raportu mailem
+    if [[ -f "$report_file" ]]; then
+        /usr/local/bin/send-notification \
+            "System Diagnostic Report" \
+            "$(cat "$report_file")" \
+            "normal"
+    fi
+}
+
+# Dokumentacja użycia
+show_help() {
+    cat << EOF
+Ghost Installation and Management Script v${SCRIPT_VERSION}
+
+Użycie: $0 [opcja] [argumenty]
+
+Opcje:
+    install             Pełna instalacja Ghost
+    update             Aktualizacja Ghost do najnowszej wersji
+    ssl <command>      Zarządzanie certyfikatami SSL (create|renew|status)
+    cleanup            Czyszczenie systemu
+    diagnose           Diagnostyka systemu
+    verify             Weryfikacja instalacji
+    backup             Wykonanie backupu
+    help               Wyświetlenie tej pomocy
+
+Przykłady:
+    $0 install                     # Instalacja Ghost
+    $0 update                      # Aktualizacja Ghost
+    $0 ssl renew                   # Odnowienie certyfikatu SSL
+    $0 diagnose                    # Uruchomienie diagnostyki
+
+Zmienne środowiskowe:
+    DOMAIN              Domena dla instalacji Ghost
+    ADMIN_EMAIL         Email administratora
+    VERBOSE            Włączenie trybu verbose (1/0)
+
+EOF
+}
+
+# Rozszerzenie głównej funkcji o obsługę parametrów
+main() {
+    local command="${1:-}"
+    shift || true
+    
+    case "$command" in
+        "install")
+            log "INFO" "Rozpoczęcie instalacji Ghost v${SCRIPT_VERSION}..."
+            install_ghost
+            ;;
+        "update")
+            update_ghost
+            ;;
+        "ssl")
+            manage_ssl "$@"
+            ;;
+        "cleanup")
+            cleanup_system
+            ;;
+        "diagnose")
+            diagnose_system
+            ;;
+        "verify")
+            verify_installation
+            ;;
+        "backup")
+            /usr/local/bin/ghost-backup.sh
+            ;;
+        "help"|"--help"|"-h")
+            show_help
+            ;;
+        *)
+            log "ERROR" "Nieznane polecenie: $command"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+# Uruchomienie skryptu z obsługą parametrów
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi    # Test systemu powiadomień
+    /usr/local/bin/send-notification \
+        "System Installation" \
+        "Ghost monitoring system has been configured successfully" \
+        "normal"
+}
+
+# Funkcja weryfikacji instalacji
+verify_installation() {
+    log "INFO" "Weryfikacja instalacji..."
+    local status=0
+
+    # Tablica testów
+    declare -A checks=(
+        ["Vault status"]="vault status"
+        ["MariaDB status"]="systemctl is-active mariadb"
+        ["Nginx status"]="systemctl is-active nginx"
+        ["Nginx config test"]="nginx -t"
+        ["Prometheus status"]="systemctl is-active prometheus"
+        ["Node Exporter status"]="systemctl is-active node_exporter"
+        ["Fail2ban status"]="systemctl is-active fail2ban"
+        ["NFTables status"]="systemctl is-active nftables"
+        ["Postfix status"]="systemctl is-active postfix"
+        ["Audit status"]="systemctl is-active auditd"
+    )
+
+    # Weryfikacja certyfikatów SSL
+    check_ssl() {
+        local domain="$1"
+        local cert_path="/etc/letsencrypt/live/${domain}/fullchain.pem"
+        
+        if [[ ! -f "$cert_path" ]]; then
+            echo "Brak certyfikatu SSL"
+            return 1
+        fi
+        
+        local expiry
+        expiry=$(openssl x509 -enddate -noout -in "$cert_path" | cut -d= -f2)
+        local expiry_epoch
+        expiry_epoch=$(date -d "$expiry" +%s)
+        local now_epoch
+        now_epoch=$(date +%s)
+        local days_left
+        days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+        
+        if (( days_left < 30 )); then
+            echo "Certyfikat SSL wygasa za $days_left dni"
+            return 1
+        fi
+        
+        return 0
+    }
+
+    # Weryfikacja portów
+    check_ports() {
+        local required_ports=(80 443 2368 9090 9100)
+        local errors=0
+        
+        for port in "${required_ports[@]}"; do
+            if ! netstat -tuln | grep -q ":${port} "; then
+                echo "Port $port nie jest otwarty"
+                errors=$((errors + 1))
+            fi
+        done
+        
+        return "$errors"
+    }
+
+    # Weryfikacja uprawnień
+    check_permissions() {
+        local errors=0
+        
+        # Sprawdzenie krytycznych katalogów
+        local directories=(
+            "$GHOST_DIR:ghost:ghost:750"
+            "$SECURE_KEY_DIR:root:root:700"
+            "$BACKUP_DIR:root:root:700"
+            "$LOG_DIR:syslog:adm:750"
+        )
+        
+        for dir_spec in "${directories[@]}"; do
+            IFS=: read -r dir owner group perm <<< "$dir_spec"
+            
+            if [[ ! -d "$dir" ]]; then
+                echo "Katalog $dir nie istnieje"
+                errors=$((errors + 1))
+                continue
+            fi
+            
+            local current_owner
+            current_owner=$(stat -c %U "$dir")
+            local current_group
+            current_group=$(stat -c %G "$dir")
+            local current_perm
+            current_perm=$(stat -c %a "$dir")
+            
+            if [[ "$current_owner" != "$owner" ]] || 
+               [[ "$current_group" != "$group" ]] || 
+               [[ "$current_perm" != "$perm" ]]; then
+                echo "Nieprawidłowe uprawnienia dla $dir"
+                echo "Oczekiwane: $owner:$group:$perm"
+                echo "Aktualne: $current_owner:$current_group:$current_perm"
+                errors=$((errors + 1))
+            fi
+        done
+        
+        return "$errors"
+    }
+
+    # Wykonanie wszystkich testów
+    log "INFO" "Sprawdzanie statusu usług..."
+    for test_name in "${!checks[@]}"; do
+        if ! eval "${checks[$test_name]}" > /dev/null 2>&1; then
+            log "ERROR" "Test '$test_name' nie powiódł się"
+            status=$((status + 1))
+        else
+            log "INFO" "Test '$test_name' zakończony pomyślnie"
+        fi
+    done
+
+    log "INFO" "Sprawdzanie certyfikatów SSL..."
+    if ! check_ssl "$DOMAIN"; then
+        log "ERROR" "Weryfikacja SSL nie powiodła się"
+        status=$((status + 1))
+    fi
+
+    log "INFO" "Sprawdzanie portów..."
+    if ! check_ports; then
+        log "ERROR" "Weryfikacja portów nie powiodła się"
+        status=$((status + 1))
+    fi
+
+    log "INFO" "Sprawdzanie uprawnień..."
+    if ! check_permissions; then
+        log "ERROR" "Weryfikacja uprawnień nie powiodła się"
+        status=$((status + 1))
+    fi
+
+    # Sprawdzenie backupu
+    log "INFO" "Testowanie systemu backupu..."
+    if ! /usr/local/bin/ghost-backup.sh; then
+        log "ERROR" "Test backupu nie powiódł się"
+        status=$((status + 1))
+    fi
+
+    return "$status"
+}
+
+# Główna funkcja instalacyjna
+install_ghost() {
+    log "INFO" "Rozpoczęcie instalacji Ghost..."
+    
+    # Przygotowanie środowiska
+    mkdir -p "$TEMP_DIR"
+    cd "$TEMP_DIR" || exit 1
+    
+    # Pobranie najnowszej wersji Ghost
+    local latest_version
+    latest_version=$(curl -s https://api.github.com/repos/TryGhost/Ghost/releases/latest | grep tag_name | cut -d '"' -f 4)
+    
+    log "INFO" "Pobieranie Ghost v${latest_version}..."
+    curl -L "https://github.com/TryGhost/Ghost/releases/download/${latest_version}/Ghost-$(echo "$latest_version" | cut -d 'v' -f2).zip" -o ghost.zip
+    
+    unzip ghost.zip -d "$GHOST_DIR"
+    
+    # Instalacja zależności
+    cd "$GHOST_DIR" || exit 1
+    npm install --production
+    
+    # Konfiguracja Ghost
+    local db_creds
+    db_creds=$(vault kv get -format=json secret/ghost/db)
+    local admin_creds
+    admin_creds=$(vault kv get -format=json secret/ghost/admin)
+    
+    cat > config.production.json << EOF
+{
+    "url": "https://${DOMAIN}",
+    "server": {
+        "host": "127.0.0.1",
+        "port": 2368
+    },
+    "database": {
+        "client": "mysql",
+        "connection": {
+            "host": "localhost",
+            "port": 3306,
+            "user": "$(echo "$db_creds" | jq -r '.data.data.user')",
+            "password": "$(echo "$db_creds" | jq -r '.data.data.pass')",
+            "database": "$(echo "$db_creds" | jq -r '.data.data.name')"
+        },
+        "pool": {
+            "min": 2,
+            "max": 10
+        }
+    },
+    "mail": {
+        "transport": "SMTP",
+        "options": {
+            "host": "localhost",
+            "port": 25,
+            "secure": false
+        }
+    },
+    "process": "systemd",
+    "logging": {
+        "level": "info",
+        "rotation": {
+            "enabled": true,
+            "period": "1d",
+            "count": 10
+        },
+        "transports": ["file", "stdout"]
+    },
+    "paths": {
+        "contentPath": "/var/www/ghost/content"
+    }
+}
+EOF
+
+    # Konfiguracja systemd
+    cat > /etc/systemd/system/ghost.service << EOF
+[Unit]
+Description=Ghost Blog
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=simple
+User=ghost
+Group=ghost
+WorkingDirectory=/var/www/ghost
+Environment="NODE_ENV=production"
+ExecStart=/usr/bin/node current/index.js
+Restart=always
+RestartSec=10
+SyslogIdentifier=ghost
+
+# Limity bezpieczeństwa
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadOnlyDirectories=/
+ReadWriteDirectories=/var/www/ghost/content
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Tworzenie użytkownika ghost
+    useradd -r -s /bin/false ghost
+    chown -R ghost:ghost "$GHOST_DIR"
+    
+    # Uruchomienie Ghost
+    systemctl daemon-reload
+    systemctl enable ghost
+    systemctl start ghost
+    
+    # Oczekiwanie na uruchomienie Ghost
+    local timeout=30
+    local counter=0
+    while ! curl -s http://localhost:2368 > /dev/null; do
+        sleep 1
+        counter=$((counter + 1))
+        if ((counter >= timeout)); then
+            log "ERROR" "Timeout podczas uruchamiania Ghost"
+            return 1
         fi
     done
 }
 
-# Generowanie losowych portów
-GRAFANA_PORT=$(generate_random_port)
-PROMETHEUS_PORT=$(generate_random_port)
-LOKI_PORT=$(generate_random_port)
+# Główna funkcja
+main() {
+    log "INFO" "Rozpoczęcie instalacji Ghost v${SCRIPT_VERSION}..."
+    
+    # Inicjalizacja blokady
+    acquire_lock "ghost-install"
+    
+    # Wykonanie wszystkich kroków instalacji
+    setup_logging
+    validate_environment
+    check_system_requirements
+    install_required_packages
+    setup_secure_filesystem
+    setup_vault
+    generate_secure_credentials
+    setup_kernel_security
+    setup_mariadb
+    setup_nginx
+    setup_firewall
+    install_ghost
+    setup_backups
+    setup_monitoring
+    setup_system_audit
+    setup_notifications
+    setup_auto_updates
+    
+    # Weryfikacja instalacji
+    if verify_installation; then
+        log "INFO" "Instalacja zakończona pomyślnie"
+        /usr/local/bin/send-notification \
+            "Installation Complete" \
+            "Ghost has been successfully installed and configured on ${DOMAIN}" \
+            "normal"
+    else
+        log "ERROR" "Instalacja zakończona z błędami"
+        /usr/local/bin/send-notification \
+            "Installation Failed" \
+            "Ghost installation on ${DOMAIN} completed with errors. Please check logs." \
+            "high"
+        exit 1
+    fi
+    
+    # Zwolnienie blokady
+    release_lock "ghost-install"
+}
 
-# Funkcja rotacji logów
-setup_log_rotation() {
-    cat > /etc/logrotate.d/ghost <<EOF
-$SCRIPT_LOG {
+# Uruchomienie skryptu
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi/var/lib/apt/listchanges.db
+only_on_upgrade=false
+which=news
+EOF
+
+    # Włączenie automatycznych aktualizacji
+    echo unattended-upgrades unattended-upgrades/enable_auto_updates boolean true | debconf-set-selections
+    dpkg-reconfigure -f noninteractive unattended-upgrades
+}
+
+# Funkcja konfigurująca zabezpieczenia kernela
+setup_kernel_security() {
+    log "INFO" "Konfiguracja zabezpieczeń kernela..."
+    
+    # Konfiguracja parametrów sysctl
+    cat > /etc/sysctl.d/99-security.conf << EOF
+# Ochrona przed atakami sieciowymi
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 5
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.icmp_echo_ignore_all = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# IPv6 zabezpieczenia
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+
+# Ochrona przed atakami na pamięć
+kernel.randomize_va_space = 2
+kernel.kptr_restrict = 2
+kernel.yama.ptrace_scope = 1
+kernel.dmesg_restrict = 1
+kernel.sysrq = 0
+kernel.core_uses_pid = 1
+kernel.panic = 60
+kernel.panic_on_oops = 60
+
+# Limity systemowe
+fs.file-max = 65535
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.suid_dumpable = 0
+
+# Buforowanie i pamięć
+vm.swappiness = 10
+vm.dirty_ratio = 20
+vm.dirty_background_ratio = 5
+vm.mmap_min_addr = 65536
+vm.overcommit_memory = 0
+vm.panic_on_oom = 0
+vm.oom_kill_allocating_task = 0
+EOF
+
+    # Załadowanie nowych ustawień
+    sysctl -p /etc/sysctl.d/99-security.conf
+    
+    # Zabezpieczenie modułów kernela
+    cat > /etc/modprobe.d/blacklist-dangerous.conf << EOF
+# Protokoły rzadko używane
+install dccp /bin/false
+install sctp /bin/false
+install rds /bin/false
+install tipc /bin/false
+
+# Systemy plików egzotyczne
+install cramfs /bin/false
+install freevxfs /bin/false
+install jffs2 /bin/false
+install hfs /bin/false
+install hfsplus /bin/false
+install squashfs /bin/false
+install udf /bin/false
+
+# Protokoły przestarzałe
+install ax25 /bin/false
+install netrom /bin/false
+install x25 /bin/false
+install rose /bin/false
+install decnet /bin/false
+install econet /bin/false
+install af_802154 /bin/false
+install ipx /bin/false
+install appletalk /bin/false
+install psnap /bin/false
+install p8023 /bin/false
+install p8022 /bin/false
+install can /bin/false
+install atm /bin/false
+EOF
+}
+
+# Funkcja konfigurująca firewall
+setup_firewall() {
+    log "INFO" "Konfiguracja firewalla..."
+    
+    # Instalacja i konfiguracja nftables
+    cat > /etc/nftables.conf << EOF
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        
+        # Dozwolony localhost
+        iif lo accept
+        
+        # Ustalone połączenia
+        ct state established,related accept
+        
+        # ICMP/ICMPv6
+        ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } accept
+        ip6 nexthdr icmpv6 icmpv6 type { echo-request, destination-unreachable, time-exceeded, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, nd-router-solicit } accept
+        
+        # SSH (z rate limitingiem)
+        tcp dport ssh ct state new limit rate 10/minute accept
+        
+        # HTTP/HTTPS
+        tcp dport { http, https } accept
+        udp dport https accept  # QUIC/HTTP3
+        
+        # Ghost
+        tcp dport 2368 accept
+        
+        # Node Exporter dla Prometheus
+        ip saddr 127.0.0.1 tcp dport 9100 accept
+        
+        # Logowanie odrzuconych
+        counter drop
+    }
+    
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+    
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}
+
+# Tablica dla ochrony przed skanowaniem portów
+table inet portscan {
+    set flood_ports {
+        type inet_service
+        flags dynamic,timeout
+        timeout 60s
+    }
+    
+    chain scan_guard {
+        type filter hook input priority -10; policy accept;
+        tcp flags & (fin|syn|rst|psh|ack|urg) == fin|syn|rst|psh|ack|urg counter drop
+        tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 counter drop
+        tcp flags syn tcp dport != 22 add @flood_ports { tcp dport limit rate over 50/minute } counter drop
+    }
+}
+EOF
+
+    # Włączenie i uruchomienie nftables
+    systemctl enable nftables
+    systemctl restart nftables
+    
+    # Konfiguracja fail2ban z nftables
+    cat > /etc/fail2ban/action.d/nftables-common.local << EOF
+[Definition]
+actionstart = nft add table inet fail2ban
+              nft add chain inet fail2ban blacklist
+              nft add chain inet fail2ban input { type filter hook input priority -1 \; policy accept \; }
+              nft add rule inet fail2ban input ip saddr @blacklist counter drop
+
+actionstop = nft delete table inet fail2ban
+
+actionban = nft add element inet fail2ban blacklist { <ip> }
+
+actionunban = nft delete element inet fail2ban blacklist { <ip> }
+EOF
+}
+
+# Funkcja konfigurująca audyt systemowy
+setup_system_audit() {
+    log "INFO" "Konfiguracja audytu systemowego..."
+    
+    # Konfiguracja auditd
+    cat > /etc/audit/rules.d/ghost.rules << EOF
+# Monitorowanie zmian w plikach konfiguracyjnych
+-w /etc/ghost/ -p wa -k ghost_config
+-w /etc/nginx/ -p wa -k nginx_config
+-w /etc/mysql/ -p wa -k mysql_config
+
+# Monitorowanie dostępu do plików Ghost
+-w ${GHOST_DIR}/config.production.json -p rwa -k ghost_config_access
+-w ${GHOST_DIR}/content/data/ -p wa -k ghost_data_access
+-w ${GHOST_DIR}/content/images/ -p wa -k ghost_image_access
+
+# Monitorowanie wykonywania poleceń sudo
+-a exit,always -F arch=b64 -S execve -F euid=0 -F auid>=1000 -F auid!=4294967295 -k sudo_commands
+
+# Monitorowanie zmian w użytkownikach i grupach
+-w /etc/passwd -p wa -k user_modification
+-w /etc/group -p wa -k group_modification
+-w /etc/shadow -p wa -k shadow_modification
+-w /etc/sudoers -p wa -k sudoers_modification
+
+# Monitorowanie operacji montowania
+-a always,exit -F arch=b64 -S mount -S umount2 -k mount_operations
+
+# Monitorowanie nieudanych prób logowania
+-w /var/log/auth.log -p wa -k auth_log
+-w /var/log/nginx/access.log -p wa -k nginx_access
+-w /var/log/nginx/error.log -p wa -k nginx_error
+-w /var/log/mysql/error.log -p wa -k mysql_error
+
+# Monitorowanie procesów Ghost
+-w /usr/bin/node -p x -k ghost_execution
+EOF
+
+    # Restart auditd
+    systemctl restart auditd
+    
+    # Konfiguracja rsyslog dla lepszego logowania
+    cat > /etc/rsyslog.d/ghost.conf << EOF
+# Ghost aplikacja
+if \$programname == 'ghost' then /var/log/ghost/application.log
+& stop
+
+# Nginx
+if \$programname == 'nginx' then /var/log/nginx/full.log
+& stop
+
+# MariaDB
+if \$programname == 'mysqld' then /var/log/mysql/full.log
+& stop
+
+# Bezpieczeństwo
+if \$programname contains 'fail2ban' then /var/log/security.log
+if \$programname contains 'auditd' then /var/log/security.log
+if \$programname contains 'nftables' then /var/log/security.log
+& stop
+EOF
+
+    # Restart rsyslog
+    systemctl restart rsyslog
+    
+    # Konfiguracja logrotate dla nowych logów
+    cat > /etc/logrotate.d/ghost-security << EOF
+/var/log/security.log
+/var/log/ghost/application.log
+/var/log/nginx/full.log
+/var/log/mysql/full.log {
     daily
-    rotate 14
+    rotate 30
     compress
     delaycompress
-    missingok
     notifempty
-    create 640 root root
+    create 0640 syslog adm
+    sharedscripts
     postrotate
-        systemctl reload syslog >/dev/null 2>&1 || true
+        systemctl reload rsyslog >/dev/null 2>&1 || true
     endscript
 }
 EOF
 }
 
-# Funkcja logowania
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a $SCRIPT_LOG
+# System powiadomień
+setup_notifications() {
+    log "INFO" "Konfiguracja systemu powiadomień..."
+    
+    # Instalacja i konfiguracja postfix dla powiadomień email
+    debconf-set-selections <<< "postfix postfix/mailname string ${DOMAIN}"
+    debconf-set-selections <<< "postfix postfix/main_mailer_type string 'Internet Site'"
+    apt-get install -y postfix
+
+    # Konfiguracja Postfix
+    cat > /etc/postfix/main.cf << EOF
+# Podstawowa konfiguracja
+smtpd_banner = \$myhostname ESMTP
+biff = no
+append_dot_mydomain = no
+readme_directory = no
+
+# TLS configuration
+smtpd_tls_cert_file=/etc/letsencrypt/live/${DOMAIN}/fullchain.pem
+smtpd_tls_key_file=/etc/letsencrypt/live/${DOMAIN}/privkey.pem
+smtpd_use_tls=yes
+smtpd_tls_auth_only = yes
+smtp_tls_security_level = may
+smtpd_tls_security_level = may
+smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
+smtpd_tls_mandatory_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
+smtp_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
+smtp_tls_mandatory_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
+smtpd_tls_mandatory_ciphers = high
+tls_high_cipherlist = ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384
+
+# Zabezpieczenia
+smtpd_helo_required = yes
+smtpd_helo_restrictions = permit_mynetworks,reject_invalid_helo_hostname,reject_non_fqdn_helo_hostname
+smtpd_sender_restrictions = reject_non_fqdn_sender,reject_unknown_sender_domain
+smtpd_recipient_restrictions = reject_non_fqdn_recipient,reject_unknown_recipient_domain,permit_mynetworks,reject_unauth_destination
+disable_vrfy_command = yes
+
+# Limity
+message_size_limit = 10485760
+mailbox_size_limit = 0
+
+# Sieć
+myhostname = ${DOMAIN}
+mydomain = ${DOMAIN}
+myorigin = \$mydomain
+inet_interfaces = loopback-only
+inet_protocols = ipv4
+mydestination = \$myhostname, localhost.\$mydomain, localhost
+mynetworks = 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128
+EOF
+
+    # Script powiadomień
+    cat > /usr/local/bin/send-notification << 'EOF'
+#!/bin/bash
+set -euo pipefail
+
+SUBJECT="$1"
+MESSAGE="$2"
+PRIORITY="${3:-normal}"  # normal, high, low
+
+# Formatowanie wiadomości
+FORMATTED_MESSAGE="
+Priority: ${PRIORITY}
+Date: $(date)
+Host: $(hostname)
+
+${MESSAGE}
+
+---
+This is an automated message from Ghost monitoring system.
+"
+
+# Wysyłanie emaila
+echo "${FORMATTED_MESSAGE}" | mailx -s "[Ghost] ${SUBJECT}" \
+    -r "ghost-monitor@${DOMAIN}" "${ADMIN_EMAIL}"
+
+# Jeśli priorytet wysoki, wysyłamy też do syslog
+if [[ "${PRIORITY}" == "high" ]]; then
+    logger -t ghost-monitor -p daemon.alert "${SUBJECT}: ${MESSAGE}"
+fi
+EOF
+    chmod +x /usr/local/bin/send-notification
+
+    # Test systemu powiadom    # Testowanie konfiguracji
+    if ! nginx -t; then
+        error_log "Błędna konfiguracja Nginx"
+    fi
+    
+    systemctl restart nginx
 }
 
-error() {
-    echo -e "${RED}[ERROR][$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a $SCRIPT_LOG
-    cleanup_and_exit
-    exit 1
+# Funkcja konfigurująca backupy
+setup_backups() {
+    log "INFO" "Konfiguracja systemu backupów..."
+    
+    local backup_script="/usr/local/bin/ghost-backup.sh"
+    
+    # Tworzenie skryptu backupu
+    cat > "$backup_script" << 'EOF'
+#!/bin/bash
+set -euo pipefail
+
+# Konfiguracja
+BACKUP_DIR="/var/backups/ghost"
+DATE=$(date +%Y%m%d_%H%M%S)
+RETENTION_DAYS=7
+MIN_SPACE_KB=$((5 * 1024 * 1024))  # 5GB w KB
+
+# Pobranie poświadczeń z Vault
+DB_CREDS=$(vault kv get -format=json secret/ghost/db)
+DB_NAME=$(echo "$DB_CREDS" | jq -r '.data.data.name')
+DB_USER=$(echo "$DB_CREDS" | jq -r '.data.data.user')
+DB_PASS=$(echo "$DB_CREDS" | jq -r '.data.data.pass')
+ENCRYPTION_KEY=$(vault kv get -format=json secret/ghost/encryption | jq -r '.data.data.key')
+
+# Funkcja sprawdzająca przestrzeń
+check_disk_space() {
+    local available_space
+    available_space=$(df "$BACKUP_DIR" | awk 'NR==2 {print $4}')
+    if ((available_space < MIN_SPACE_KB)); then
+        echo "BŁĄD: Za mało miejsca na dysku (dostępne: ${available_space}KB, wymagane: ${MIN_SPACE_KB}KB)" >&2
+        exit 1
+    fi
 }
 
-warning() {
-    echo -e "${YELLOW}[WARNING][$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a $SCRIPT_LOG
+# Funkcja backupu z kompresją przyrostową
+backup_files() {
+    local target="$BACKUP_DIR/ghost_files_$DATE.tar.zst"
+    local last_backup
+    
+    # Znajdź ostatni backup
+    last_backup=$(find "$BACKUP_DIR" -name "ghost_files_*.tar.zst" -type f -printf '%T@ %p\n' | sort -n | tail -n 1 | cut -d' ' -f2)
+    
+    if [[ -n "$last_backup" ]]; then
+        # Backup przyrostowy
+        tar --zstd -cf "$target" \
+            --newer-mtime="$last_backup" \
+            --exclude="*.log" \
+            --exclude="node_modules" \
+            /var/www/ghost
+    else
+        # Pełny backup
+        tar --zstd -cf "$target" \
+            --exclude="*.log" \
+            --exclude="node_modules" \
+            /var/www/ghost
+    fi
+    
+    # Szyfrowanie
+    openssl enc -aes-256-cbc -salt -pbkdf2 \
+        -in "$target" -out "${target}.enc" -pass env:ENCRYPTION_KEY
+    rm "$target"
 }
 
-# Funkcja sprzątająca
-cleanup_and_exit() {
-    log "Czyszczenie tymczasowych plików..."
-    # Dodaj tutaj czyszczenie plików tymczasowych
-    rm -f /tmp/ghost_install_*
+# Funkcja backupu bazy danych
+backup_database() {
+    local target="$BACKUP_DIR/ghost_db_$DATE.sql.zst"
+    
+    # Backup z kompresją zstd
+    mysqldump --single-transaction --quick --lock-tables=false \
+        -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" | \
+        zstd -19 -T0 > "$target"
+    
+    # Szyfrowanie
+    openssl enc -aes-256-cbc -salt -pbkdf2 \
+        -in "$target" -out "${target}.enc" -pass env:ENCRYPTION_KEY
+    rm "$target"
 }
 
-# Walidacja hasła
-validate_password() {
-    local pass="$1"
-    local min_length=16
-    local max_length=128
+# Funkcja weryfikacji backupu
+verify_backup() {
+    local file="$1"
+    local temp_file
+    temp_file=$(mktemp)
     
-    # Sprawdź długość
-    if [[ ${#pass} -lt $min_length ]] || [[ ${#pass} -gt $max_length ]]; then
+    if ! openssl enc -aes-256-cbc -d -salt -pbkdf2 \
+        -in "$file" -pass env:ENCRYPTION_KEY -out "$temp_file" 2>/dev/null; then
+        echo "BŁĄD: Backup $file jest uszkodzony!" >&2
+        rm "$temp_file"
         return 1
     fi
     
-    # Sprawdź złożoność
-    if [[ ! $pass =~ [A-Z] ]] || \
-       [[ ! $pass =~ [a-z] ]] || \
-       [[ ! $pass =~ [0-9] ]] || \
-       [[ ! $pass =~ [^[:alnum:]] ]]; then
-        return 1
-    fi
-    
-    # Sprawdź niebezpieczne znaki
-    if [[ $pass =~ [\'\"\\] ]]; then
-        return 1
-    fi
-    
-    # Sprawdź białe znaki
-    if [[ $pass =~ [[:space:]] ]]; then
-        return 1
-    fi
-    
-    # Sprawdź powtarzające się znaki
-    if [[ $pass =~ (.)\1{2,} ]]; then
-        return 1
-    fi
-    
-    # Sprawdź sekwencje
-    if [[ $pass =~ (abc|123|qwe|ABC) ]]; then
-        return 1
-    fi
-    
+    rm "$temp_file"
     return 0
 }
 
-# Generowanie bezpiecznego hasła
-generate_secure_password() {
-    local length=$1
-    local pass
-    local charset='A-Za-z0-9!@#$%^&*()_+=-'
-    
-    # Sprawdź limity długości
-    if [ $length -lt 16 ]; then
-        length=16
-    elif [ $length -gt 128 ]; then
-        length=128
-    fi
-    
-    while true; do
-        # Generuj hasło z różnych źródeł entropii
-        pass=$(cat /dev/urandom | tr -dc "$charset" | fold -w $length | head -n 1)
-        
-        # Sprawdź czy hasło spełnia wymagania
-        if validate_password "$pass"; then
-            echo "$pass"
-            break
-        fi
-    done
-}
-
-# Generowanie i szyfrowanie danych dostępowych
-generate_secure_credentials() {
-    log "Generowanie bezpiecznych danych dostępowych..."
-    
-    # Generowanie haseł
-    MYSQL_ROOT_PASSWORD=$(generate_secure_password 64)
-    MYSQL_PASSWORD=$(generate_secure_password 48)
-    REDIS_PASSWORD=$(generate_secure_password 48)
-    GRAFANA_ADMIN_PASSWORD=$(generate_secure_password 32)
-    PROMETHEUS_PASSWORD=$(generate_secure_password 32)
-    LOKI_PASSWORD=$(generate_secure_password 32)
-
-    # Generowanie nazw użytkowników i baz danych
-    DB_NAME="ghost_$(date +%Y%m%d)_$(openssl rand -hex 4)"
-    DB_USER="ghost_$(openssl rand -hex 6)"
-    
-    # Zapisanie danych w pliku credentials
-    mkdir -p $(dirname $CREDENTIALS_FILE)
-    cat > $CREDENTIALS_FILE <<EOF
-# Ghost Installation Credentials
-# Generated: $(date)
-# WAŻNE: Ten plik jest zaszyfrowany. Klucz deszyfrujący znajduje się w ${CREDENTIALS_FILE}.key
-
-=== PORTY USŁUG ===
-Grafana Port: $GRAFANA_PORT
-Prometheus Port: $PROMETHEUS_PORT
-Loki Port: $LOKI_PORT
-
-=== DATABASE CREDENTIALS ===
-Database Name: $DB_NAME
-Database User: $DB_USER
-Database Password: $MYSQL_PASSWORD
-Database Root Password: $MYSQL_ROOT_PASSWORD
-
-=== REDIS CREDENTIALS ===
-Redis Password: $REDIS_PASSWORD
-
-=== MONITORING CREDENTIALS ===
-Grafana Admin Password: $GRAFANA_ADMIN_PASSWORD
-Prometheus Password: $PROMETHEUS_PASSWORD
-Loki Password: $LOKI_PASSWORD
-
-=== ACCESS URLS ===
-Ghost Admin: https://$DOMAIN/ghost
-Grafana: https://$DOMAIN:$GRAFANA_PORT
-Prometheus: https://$DOMAIN:$PROMETHEUS_PORT
-EOF
-
-    # Szyfrowanie pliku z danymi
-    encrypt_credentials
-}
-
-# Funkcja szyfrowania credentials
-encrypt_credentials() {
-    local key=$(openssl rand -hex 32)
-    local iv=$(openssl rand -hex 16)
-    
-    # Szyfrowanie z użyciem AES-256-GCM
-    openssl enc -aes-256-gcm -salt \
-        -in "$CREDENTIALS_FILE" \
-        -out "${CREDENTIALS_FILE}.enc" \
-        -K "$key" \
-        -iv "$iv" \
-        -iter 100000
-        
-    # Zapisanie klucza i IV w bezpiecznym miejscu
-    echo "Encryption Key: $key" > "${CREDENTIALS_FILE}.key"
-    echo "IV: $iv" >> "${CREDENTIALS_FILE}.key"
-    chmod 600 "${CREDENTIALS_FILE}.key"
-    
-    # Usunięcie oryginalnego pliku
-    shred -u "$CREDENTIALS_FILE"
-    mv "${CREDENTIALS_FILE}.enc" "$CREDENTIALS_FILE"
-}
-
-# Sprawdzanie wymagań systemowych
-check_system_requirements() {
-    log "Sprawdzanie wymagań systemowych..."
-    
-    # Sprawdź minimalne wymagania RAM
-    total_memory=$(free -m | awk '/^Mem:/{print $2}')
-    if [ $total_memory -lt 2048 ]; then
-        error "Wymagane minimum 2GB RAM"
-    fi
-    
-    # Sprawdź dostępne miejsce na dysku
-    free_space=$(df -m / | awk 'NR==2 {print $4}')
-    if [ $free_space -lt 10240 ]; then
-        error "Wymagane minimum 10GB wolnego miejsca na dysku"
-    fi
-    
-    # Sprawdź wersję systemu
-    if [ ! -f /etc/os-release ]; then
-        error "Nie można określić wersji systemu"
-    fi
-    . /etc/os-release
-    if [[ ! $VERSION_ID =~ ^(20.04|22.04)$ ]]; then
-        error "Wymagana Ubuntu 20.04 LTS lub 22.04 LTS"
-    fi
-    
-    # Sprawdź wymagane pakiety
-    required_packages=(docker.io docker-compose curl wget openssl)
-    missing_packages=()
-    
-    for package in "${required_packages[@]}"; do
-        if ! dpkg -l | grep -q "^ii  $package "; then
-            missing_packages+=($package)
-        fi
-    done
-    
-    if [ ${#missing_packages[@]} -ne 0 ]; then
-        log "Instalacja brakujących pakietów: ${missing_packages[*]}"
-        apt-get update
-        apt-get install -y "${missing_packages[@]}"
-    fi
-}
-
-# Sprawdzanie zajętych portów
-check_ports() {
-    local ports=($GRAFANA_PORT $PROMETHEUS_PORT $LOKI_PORT)
-    for port in "${ports[@]}"; do
-        if netstat -tuln | grep -q ":$port "; then
-            error "Port $port jest już zajęty"
-        fi
-    done
-}
-
-# Konfiguracja Grafany z zabezpieczeniami
-setup_grafana() {
-    log "Konfiguracja Grafany..."
-    
-    cat > $MONITORING_DIR/grafana/grafana.ini <<EOF
-[server]
-http_port = $GRAFANA_PORT
-domain = $DOMAIN
-root_url = https://$DOMAIN:$GRAFANA_PORT
-cert_file = /etc/letsencrypt/live/$DOMAIN/fullchain.pem
-cert_key = /etc/letsencrypt/live/$DOMAIN/privkey.pem
-protocol = https
-
-[security]
-admin_user = admin
-admin_password = $GRAFANA_ADMIN_PASSWORD
-secret_key = $(openssl rand -hex 32)
-disable_gravatar = true
-cookie_secure = true
-cookie_samesite = strict
-allow_embedding = false
-strict_transport_security = true
-strict_transport_security_max_age_seconds = 31536000
-strict_transport_security_preload = true
-strict_transport_security_subdomains = true
-x_content_type_options = true
-x_xss_protection = true
-
-[auth]
-disable_login_form = false
-login_maximum_inactive_lifetime_days = 7
-login_maximum_lifetime_days = 30
-disable_brute_force_login_protection = false
-max_login_attempts = 5
-minimum_password_length = 16
-password_require_uppercase = true
-password_require_lowercase = true
-password_require_number = true
-password_require_special = true
-
-[analytics]
-reporting_enabled = false
-check_for_updates = false
-
-[snapshots]
-external_enabled = false
-
-[users]
-allow_sign_up = false
-default_theme = dark
-auto_assign_org_role = Viewer
-
-[auth.anonymous]
-enabled = false
-
-[session]
-provider = redis
-provider_config = addr=redis:6379,password=${REDIS_PASSWORD},db=0,pool_size=100,idle_timeout=30s
-
-[log]
-mode = console file
-level = info
-filters = rotating:maxfiles=10,maxsize=10MB
-EOF
-
-    # Dodanie dashboardów monitoringu
-    mkdir -p $MONITORING_DIR/grafana/provisioning/dashboards
-    cat > $MONITORING_DIR/grafana/provisioning/dashboards/ghost.json <<EOF
-{
-  "annotations": {
-    "list": []
-  },
-  "editable": true,
-  "fiscalYearStartMonth": 0,
-  "graphTooltip": 0,
-  "links": [],
-  "liveNow": false,
-  "panels": [
-    {
-      "datasource": "Prometheus",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "lineInterpolation": "smooth",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 0
-      },
-      "id": 1,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "title": "Ghost Performance Metrics",
-      "type": "timeseries"
-    }
-  ],
-  "schemaVersion": 38,
-  "style": "dark",
-  "tags": ["ghost"],
-  "templating": {
-    "list": []
-  },
-  "time": {
-    "from": "now-6h",
-    "to": "now"
-  },
-  "title": "Ghost Dashboard",
-  "uid": "ghost_metrics",
-  "version": 1
-}
-EOF
-}
-
-# Konfiguracja Prometheusa z zabezpieczeniami
-setup_prometheus() {
-    log "Konfiguracja Prometheusa..."
-    
-    # Generowanie hasła bcrypt dla basic auth
-    PROMETHEUS_HTPASSWD=$(htpasswd -nbB admin $PROMETHEUS_PASSWORD)
-    
-    cat > $MONITORING_DIR/prometheus/prometheus.yml <<EOF
-global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
-  external_labels:
-    monitor: 'ghost-monitor'
-
-# Basic auth configuration
-basic_auth_users:
-  admin: ${PROMETHEUS_HTPASSWD#admin:}
-
-scrape_configs:
-  - job_name: 'ghost'
-    metrics_path: '/metrics'
-    scheme: https
-    basic_auth:
-      username: admin
-      password: ${PROMETHEUS_PASSWORD}
-    tls_config:
-      cert_file: /etc/letsencrypt/live/$DOMAIN/cert.pem
-      key_file: /etc/letsencrypt/live/$DOMAIN/privkey.pem
-      insecure_skip_verify: false
-    static_configs:
-      - targets: ['ghost:2368']
-    
-  - job_name: 'node'
-    static_configs:
-      - targets: ['node-exporter:9100']
-    
-  - job_name: 'mysql'
-    static_configs:
-      - targets: ['mysqld-exporter:9104']
-    
-  - job_name: 'redis'
-    static_configs:
-      - targets: ['redis-exporter:9121']
-    
-  - job_name: 'cadvisor'
-    static_configs:
-      - targets: ['cadvisor:8080']
-
-  - job_name: 'blackbox'
-    metrics_path: /probe
-    params:
-      module: [http_2xx]
-    static_configs:
-      - targets:
-        - https://${DOMAIN}
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: __param_target
-      - source_labels: [__param_target]
-        target_label: instance
-      - target_label: __address__
-        replacement: blackbox-exporter:9115
-
-# Alerting rules
-rule_files:
-  - /etc/prometheus/rules/*.yml
-
-alerting:
-  alertmanagers:
-  - static_configs:
-    - targets:
-      - 'alertmanager:9093'
-EOF
-
-    # Konfiguracja reguł alertów
-    mkdir -p $MONITORING_DIR/prometheus/rules
-    cat > $MONITORING_DIR/prometheus/rules/ghost_alerts.yml <<EOF
-groups:
-- name: ghost_alerts
-  rules:
-  - alert: HighMemoryUsage
-    expr: process_resident_memory_bytes{job="ghost"} > 1.5e+9
-    for: 5m
-    labels:
-      severity: warning
-    annotations:
-      summary: High memory usage in Ghost (instance {{ \$labels.instance }})
-      description: Ghost memory usage is above 1.5GB for 5 minutes
-
-  - alert: HighCPUUsage
-    expr: rate(process_cpu_seconds_total{job="ghost"}[5m]) * 100 > 80
-    for: 5m
-    labels:
-      severity: warning
-    annotations:
-      summary: High CPU usage in Ghost (instance {{ \$labels.instance }})
-      description: Ghost CPU usage is above 80% for 5 minutes
-
-  - alert: SSLCertificateExpiringSoon
-    expr: probe_ssl_earliest_cert_expiry - time() < 86400 * 30
-    for: 1h
-    labels:
-      severity: warning
-    annotations:
-      summary: "SSL Certificate expiring soon for {{ \$labels.instance }}"
-      description: "SSL certificate will expire in less than 30 days"
-
-  - alert: HighDatabaseConnections
-    expr: mysql_global_status_threads_connected > 100
-    for: 5m
-    labels:
-      severity: warning
-    annotations:
-      summary: High number of database connections
-      description: More than 100 active database connections
-
-  - alert: SlowQueries
-    expr: rate(mysql_global_status_slow_queries[5m]) > 0
-    for: 5m
-    labels:
-      severity: warning
-    annotations:
-      summary: Slow queries detected
-      description: Database is experiencing slow queries
-
-  - alert: HighRedisMemory
-    expr: redis_memory_used_bytes / redis_memory_max_bytes * 100 > 80
-    for: 5m
-    labels:
-      severity: warning
-    annotations:
-      summary: High Redis memory usage
-      description: Redis memory usage is above 80%
-
-  - alert: GhostDown
-    expr: up{job="ghost"} == 0
-    for: 2m
-    labels:
-      severity: critical
-    annotations:
-      summary: Ghost is down
-      description: Ghost instance has been down for more than 2 minutes
-
-  - alert: DatabaseDown
-    expr: up{job="mysql"} == 0
-    for: 1m
-    labels:
-      severity: critical
-    annotations:
-      summary: Database is down
-      description: MySQL database has been down for more than 1 minute
-
-  - alert: RedisDown
-    expr: up{job="redis"} == 0
-    for: 1m
-    labels:
-      severity: critical
-    annotations:
-      summary: Redis is down
-      description: Redis instance has been down for more than 1 minute
-
-  - alert: HighErrorRate
-    expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) * 100 > 5
-    for: 5m
-    labels:
-      severity: warning
-    annotations:
-      summary: High error rate
-      description: More than 5% of requests are resulting in errors
-EOF
-}
-
-# Konfiguracja Loki z zabezpieczeniami
-setup_loki() {
-    log "Konfiguracja Loki..."
-    
-    cat > $MONITORING_DIR/loki/loki.yml <<EOF
-auth_enabled: true
-
-server:
-  http_listen_port: ${LOKI_PORT}
-  http_server_read_timeout: 120s
-  http_server_write_timeout: 120s
-  http_server_idle_timeout: 120s
-
-ingester:
-  lifecycler:
-    address: 127.0.0.1
-    ring:
-      kvstore:
-        store: inmemory
-      replication_factor: 1
-    final_sleep: 0s
-  chunk_idle_period: 5m
-  chunk_retain_period: 30s
-  wal:
-    enabled: true
-    dir: /tmp/loki/wal
-
-schema_config:
-  configs:
-    - from: 2023-01-01
-      store: boltdb-shipper
-      object_store: filesystem
-      schema: v11
-      index:
-        prefix: index_
-        period: 24h
-
-storage_config:
-  boltdb_shipper:
-    active_index_directory: /tmp/loki/index
-    cache_location: /tmp/loki/cache
-    shared_store: filesystem
-  filesystem:
-    directory: /tmp/loki/chunks
-
-compactor:
-  working_directory: /tmp/loki/compactor
-  shared_store: filesystem
-  retention_enabled: true
-  retention_delete_delay: 2h
-  retention_delete_worker_count: 150
-
-limits_config:
-  enforce_metric_name: false
-  reject_old_samples: true
-  reject_old_samples_max_age: 168h
-  max_cache_freshness_per_query: 10m
-  split_queries_by_interval: 15m
-  ingestion_rate_mb: 4
-  ingestion_burst_size_mb: 6
-  max_query_series: 500
-  max_query_parallelism: 32
-
-chunk_store_config:
-  max_look_back_period: 0s
-
-table_manager:
-  retention_deletes_enabled: true
-  retention_period: 168h
-
-frontend:
-  max_outstanding_per_tenant: 2048
-  compress_responses: true
-
-analytics:
-  reporting_enabled: false
-
-security:
-  # Basic authentication configuration
-  auth:
-    type: basic
-    basic:
-      username: admin
-      password: ${LOKI_PASSWORD}
-EOF
-}
-
-# Konfiguracja Docker Compose
-setup_docker_compose() {
-    log "Konfiguracja Docker Compose..."
-    
-    cat > $INSTALL_DIR/docker-compose.yml <<EOF
-version: '3.8'
-
-x-logging: &default-logging
-  options:
-    max-size: "10m"
-    max-file: "3"
-
-services:
-  ghost:
-    image: ghost:latest@${GHOST_IMAGE_HASH}
-    restart: unless-stopped
-    environment:
-      url: https://${DOMAIN}
-      database__client: mysql
-      database__connection__host: db
-      database__connection__user: ${DB_USER}
-      database__connection__password: ${MYSQL_PASSWORD}
-      database__connection__database: ${DB_NAME}
-      NODE_ENV: production
-      mail__transport: SMTP
-      mail__options__host: ${SMTP_HOST:-smtp.example.com}
-      mail__options__port: ${SMTP_PORT:-587}
-      mail__options__auth__user: ${SMTP_USER:-user}
-      mail__options__auth__pass: ${SMTP_PASS:-pass}
-    volumes:
-      - ghost-content:/var/lib/ghost/content
-    depends_on:
-      - db
-      - redis
-    networks:
-      - ghost-internal
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 2G
-        reservations:
-          cpus: '0.5'
-          memory: 512M
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:2368/ghost/api/v3/admin/site/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-    security_opt:
-      - no-new-privileges:true
-    logging: *default-logging
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.ghost.rule=Host(\`${DOMAIN}\`)"
-      - "traefik.http.routers.ghost.tls=true"
-      - "traefik.http.routers.ghost.middlewares=secure-headers"
-      - "traefik.http.middlewares.secure-headers.headers.sslRedirect=true"
-      - "traefik.http.middlewares.secure-headers.headers.stsSeconds=31536000"
-      - "traefik.http.middlewares.secure-headers.headers.stsIncludeSubdomains=true"
-      - "traefik.http.middlewares.secure-headers.headers.stsPreload=true"
-
-  db:
-    image: mysql:8.0
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME}
-      MYSQL_USER: ${DB_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-    volumes:
-      - mysql-data:/var/lib/mysql
-      - ./mysql.cnf:/etc/mysql/conf.d/custom.cnf:ro
-    networks:
-      - ghost-internal
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u$$MYSQL_USER", "-p$$MYSQL_PASSWORD"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    logging: *default-logging
-    command: [
-      '--character-set-server=utf8mb4',
-      '--collation-server=utf8mb4_unicode_ci',
-      '--default-authentication-plugin=mysql_native_password',
-      '--max-connections=1000',
-      '--innodb-buffer-pool-size=1G'
-    ]
-
-  redis:
-    image: redis:alpine
-    restart: unless-stopped
-    command: redis-server --requirepass ${REDIS_PASSWORD}
-    volumes:
-      - redis-data:/data
-    networks:
-      - ghost-internal
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD", "redis-cli", "-a", "$$REDIS_PASSWORD", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    logging: *default-logging
-
-  grafana:
-    image: grafana/grafana:latest
-    restart: unless-stopped
-    volumes:
-      - ./grafana:/etc/grafana:ro
-      - grafana-data:/var/lib/grafana
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
-      - GF_SERVER_ROOT_URL=https://${DOMAIN}:${GRAFANA_PORT}
-      - GF_SECURITY_ALLOW_EMBEDDING=false
-      - GF_SECURITY_COOKIE_SECURE=true
-      - GF_SECURITY_COOKIE_SAMESITE=strict
-    ports:
-      - "127.0.0.1:${GRAFANA_PORT}:3000"
-    networks:
-      - monitoring
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    logging: *default-logging
-
-  prometheus:
-    image: prom/prometheus:latest
-    restart: unless-stopped
-    volumes:
-      - ./prometheus:/etc/prometheus:ro
-      - prometheus-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--storage.tsdb.retention.time=15d'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
-      - '--web.external-url=https://${DOMAIN}:${PROMETHEUS_PORT}'
-      - '--web.enable-admin-api=false'
-    ports:
-      - "127.0.0.1:${PROMETHEUS_PORT}:9090"
-    networks:
-      - monitoring
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    logging: *default-logging
-
-loki:
-    image: grafana/loki:latest
-    restart: unless-stopped
-    volumes:
-      - ./loki:/etc/loki:ro
-      - loki-data:/loki
-    command: -config.file=/etc/loki/loki.yml
-    ports:
-      - "127.0.0.1:${LOKI_PORT}:3100"
-    networks:
-      - monitoring
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/ready || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    logging: *default-logging
-
-  node-exporter:
-    image: prom/node-exporter:latest
-    restart: unless-stopped
-    volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /:/rootfs:ro
-    command:
-      - '--path.procfs=/host/proc'
-      - '--path.sysfs=/host/sys'
-      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
-      - '--no-collector.arp'
-      - '--no-collector.netclass'
-      - '--no-collector.netstat'
-      - '--no-collector.wireless'
-      - '--collector.netdev.device-exclude=^(veth.*|br.*|docker.*|lo|flannel.*|cali.*|tunl.*|_nomatch)$'
-    networks:
-      - monitoring
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9100/metrics || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    logging: *default-logging
-
-  cadvisor:
-    image: gcr.io/cadvisor/cadvisor:latest
-    restart: unless-stopped
-    privileged: true
-    volumes:
-      - /:/rootfs:ro
-      - /var/run:/var/run:ro
-      - /sys:/sys:ro
-      - /var/lib/docker/:/var/lib/docker:ro
-      - /dev/disk/:/dev/disk:ro
-    networks:
-      - monitoring
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/healthz || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    deploy:
-      resources:
-        limits:
-          memory: 128M
-    logging: *default-logging
-
-  blackbox-exporter:
-    image: prom/blackbox-exporter:latest
-    restart: unless-stopped
-    command:
-      - --config.file=/config/blackbox.yml
-    volumes:
-      - ./blackbox-exporter:/config
-    networks:
-      - monitoring
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9115/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    logging: *default-logging
-
-  alertmanager:
-    image: prom/alertmanager:latest
-    restart: unless-stopped
-    volumes:
-      - ./alertmanager:/etc/alertmanager
-    command:
-      - '--config.file=/etc/alertmanager/alertmanager.yml'
-      - '--storage.path=/alertmanager'
-    networks:
-      - monitoring
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9093/-/healthy || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    logging: *default-logging
-
-networks:
-  ghost-internal:
-    driver: bridge
-    internal: true
-    ipam:
-      config:
-        - subnet: 172.20.0.0/24
-          ip_range: 172.20.0.0/24
-          gateway: 172.20.0.1
-    labels:
-      description: "Internal network for Ghost services"
-    driver_opts:
-      encrypted: "true"
-
-  monitoring:
-    driver: bridge
-    internal: true
-    ipam:
-      config:
-        - subnet: 172.21.0.0/24
-          ip_range: 172.21.0.0/24
-          gateway: 172.21.0.1
-    labels:
-      description: "Internal network for monitoring services"
-    driver_opts:
-      encrypted: "true"
-
-volumes:
-  ghost-content:
-    driver: local
-  mysql-data:
-    driver: local
-  redis-data:
-    driver: local
-  grafana-data:
-    driver: local
-  prometheus-data:
-    driver: local
-  loki-data:
-    driver: local
-EOF
-}
-
-# Konfiguracja Nginx z rate limiting i zabezpieczeniami
-setup_nginx() {
-    log "Konfiguracja Nginx..."
-    
-    cat > /etc/nginx/conf.d/ghost.conf <<EOF
-# Rate limiting zones
-limit_req_zone \$binary_remote_addr zone=ghost_limit:10m rate=10r/s;
-limit_req_zone \$binary_remote_addr zone=ghost_admin_limit:10m rate=5r/s;
-
-# SSL configuration
-ssl_session_timeout 1d;
-ssl_session_cache shared:SSL:50m;
-ssl_session_tickets off;
-
-# Modern configuration
-ssl_protocols TLSv1.2 TLSv1.3;
-ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
-ssl_prefer_server_ciphers off;
-
-# HSTS
-add_header Strict-Transport-Security "max-age=63072000" always;
-
-# Additional security headers
-add_header X-Content-Type-Options "nosniff" always;
-add_header X-Frame-Options "SAMEORIGIN" always;
-add_header X-XSS-Protection "1; mode=block" always;
-add_header Referrer-Policy "no-referrer-when-downgrade" always;
-add_header Permissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()";
-
-# DDoS protection
-client_body_timeout 10s;
-client_header_timeout 10s;
-keepalive_timeout 5s 5s;
-send_timeout 10s;
-
-server {
-    listen 80;
-    server_name ${DOMAIN};
-    return 301 https://\$server_name\$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name ${DOMAIN};
-
-    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
-
-    # Root location
-    location / {
-        limit_req zone=ghost_limit burst=20 nodelay;
-        proxy_pass http://ghost:2368;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        
-        # WebSocket support
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        
-        # Timeouts
-        proxy_connect_timeout 60s;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
-    }
-
-    # Ghost Admin
-    location /ghost {
-        limit_req zone=ghost_admin_limit burst=10 nodelay;
-        proxy_pass http://ghost:2368;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        
-        # Additional security for admin
-        add_header X-Robots-Tag "noindex, nofollow" always;
-        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
-    }
-
-    # Monitoring endpoints
-    location /grafana/ {
-        proxy_pass http://grafana:3000/;
-        proxy_set_header Host \$host;
-        auth_basic "Restricted Access";
-        auth_basic_user_file /etc/nginx/.htpasswd;
-    }
-
-    location /prometheus/ {
-        proxy_pass http://prometheus:9090/;
-        proxy_set_header Host \$host;
-        auth_basic "Restricted Access";
-        auth_basic_user_file /etc/nginx/.htpasswd;
-    }
-
-    location /loki/ {
-        proxy_pass http://loki:3100/;
-        proxy_set_header Host \$host;
-        auth_basic "Restricted Access";
-        auth_basic_user_file /etc/nginx/.htpasswd;
-    }
-
-    # Static files caching
-    location ~* \.(jpg|jpeg|png|gif|ico|css|js)$ {
-        expires 7d;
-        add_header Cache-Control "public, no-transform";
-    }
-
-    # Deny access to hidden files
-    location ~ /\. {
-        deny all;
-        access_log off;
-        log_not_found off;
-    }
-}
-EOF
-}
-# Konfiguracja automatycznych backupów
-setup_backup_system() {
-    log "Konfiguracja systemu kopii zapasowych..."
-    
-    mkdir -p $INSTALL_DIR/scripts
-    cat > $INSTALL_DIR/scripts/backup.sh <<EOF
-#!/bin/bash
-
-# Konfiguracja
-BACKUP_DIR="$BACKUP_DIR"
-RETENTION_DAYS=30
-DATE=\$(date +%Y%m%d_%H%M%S)
-BACKUP_LOG="$LOG_DIR/backup.log"
-
-# Funkcja logowania
-backup_log() {
-    echo "[\$(date +'%Y-%m-%d %H:%M:%S')] \$1" | tee -a \$BACKUP_LOG
-}
-
-# Funkcja szyfrowania backupu
-encrypt_backup() {
-    local input_file="\$1"
-    local output_file="\$input_file.enc"
-    local encryption_key="\$(openssl rand -hex 32)"
-    
-    openssl enc -aes-256-gcm -salt -in "\$input_file" -out "\$output_file" -k "\$encryption_key"
-    echo "\$encryption_key" > "\$input_file.key"
-    chmod 600 "\$input_file.key"
-    rm "\$input_file"
-}
-
-# Backup bazy danych
-backup_database() {
-    local backup_file="\$BACKUP_DIR/db_\$DATE.sql.gz"
-    backup_log "Rozpoczęcie backupu bazy danych..."
-    
-    docker-compose exec -T db mysqldump \
-        --single-transaction \
-        --quick \
-        --lock-tables=false \
-        -u$DB_USER -p$MYSQL_PASSWORD $DB_NAME | gzip > "\$backup_file"
-    
-    if [ \$? -eq 0 ]; then
-        backup_log "Backup bazy danych zakończony sukcesem"
-        encrypt_backup "\$backup_file"
-    else
-        backup_log "Błąd podczas backupu bazy danych"
-        return 1
-    fi
-}
-
-# Backup contentu Ghost
-backup_ghost_content() {
-    local backup_file="\$BACKUP_DIR/content_\$DATE.tar.gz"
-    backup_log "Rozpoczęcie backupu contentu..."
-    
-    tar -czf "\$backup_file" -C $INSTALL_DIR/ghost-content .
-    
-    if [ \$? -eq 0 ]; then
-        backup_log "Backup contentu zakończony sukcesem"
-        encrypt_backup "\$backup_file"
-    else
-        backup_log "Błąd podczas backupu contentu"
-        return 1
-    fi
-}
-
-# Czyszczenie starych backupów
-cleanup_old_backups() {
-    backup_log "Czyszczenie starych backupów..."
-    
-    find "\$BACKUP_DIR" -name "*.enc" -mtime +\$RETENTION_DAYS -delete
-    find "\$BACKUP_DIR" -name "*.key" -mtime +\$RETENTION_DAYS -delete
-    
-    backup_log "Czyszczenie zakończone"
-}
-
-# Upload do zewnętrznego storage (przykład dla S3)
-upload_to_remote_storage() {
-    if [ -n "\$S3_BUCKET" ]; then
-        backup_log "Rozpoczęcie uploadu do S3..."
-        
-        for file in "\$BACKUP_DIR"/*.enc "\$BACKUP_DIR"/*.key; do
-            if [ -f "\$file" ]; then
-                aws s3 cp "\$file" "s3://\$S3_BUCKET/backups/\$(basename \$file)"
-                if [ \$? -eq 0 ]; then
-                    backup_log "Upload \$(basename \$file) zakończony sukcesem"
-                else
-                    backup_log "Błąd podczas uploadu \$(basename \$file)"
-                fi
-            fi
-        done
-    fi
-}
-
-# Rotacja logów backupu
-rotate_backup_logs() {
-    if [ -f "\$BACKUP_LOG" ]; then
-        if [ \$(stat -f%z "\$BACKUP_LOG") -gt 5242880 ]; then # 5MB
-            mv "\$BACKUP_LOG" "\$BACKUP_LOG.\$DATE"
-            gzip "\$BACKUP_LOG.\$DATE"
-        fi
-    fi
-}
-
-# Główna funkcja backup
+# Główna funkcja backupu
 main() {
-    backup_log "Rozpoczęcie procesu backupu..."
-    
-    # Sprawdzenie przestrzeni dyskowej
-    local free_space=\$(df -m "\$BACKUP_DIR" | awk 'NR==2 {print \$4}')
-    if [ \$free_space -lt 5120 ]; then # 5GB
-        backup_log "BŁĄD: Za mało miejsca na dysku (\${free_space}MB)"
+    # Sprawdzenie blokady
+    local lock_file="/var/run/ghost_backup.lock"
+    if ! mkdir "$lock_file" 2>/dev/null; then
+        echo "BŁĄD: Inny backup jest w trakcie wykonywania" >&2
         exit 1
     fi
+    trap 'rm -rf "$lock_file"' EXIT
     
-    mkdir -p "\$BACKUP_DIR"
+    # Sprawdzenie przestrzeni
+    check_disk_space
     
     # Wykonanie backupów
-    backup_database && \
-    backup_ghost_content && \
-    cleanup_old_backups && \
-    upload_to_remote_storage && \
-    rotate_backup_logs
+    backup_database &
+    backup_files &
+    wait
     
-    local status=\$?
-    if [ \$status -eq 0 ]; then
-        backup_log "Backup zakończony sukcesem"
+    # Weryfikacja
+    local status=0
+    for file in "$BACKUP_DIR"/*_"$DATE"*.enc; do
+        if ! verify_backup "$file"; then
+            status=1
+        fi
+    done
+    
+    # Czyszczenie starych backupów
+    find "$BACKUP_DIR" -type f -mtime +"$RETENTION_DAYS" -delete
+    
+    # Raport
+    if [[ $status -eq 0 ]]; then
+        echo "Backup zakończony pomyślnie - $(date)"
     else
-        backup_log "Backup zakończony z błędami (status: \$status)"
+        echo "BŁĄD: Backup zakończony z błędami - $(date)" >&2
         exit 1
     fi
 }
 
-# Uruchomienie z obsługą błędów
-{
-    flock -n 200 || {
-        backup_log "BŁĄD: Inny proces backupu jest już uruchomiony"
-        exit 1
-    }
-    
-    main
-} 200>/var/lock/ghost_backup.lock
-
+main "$@"
 EOF
 
-    chmod +x $INSTALL_DIR/scripts/backup.sh
+    chmod 700 "$backup_script"
     
-    # Dodanie do crontab
-    cat > /etc/cron.d/ghost-backup <<EOF
-# Backup codzienny o 3:00
-0 3 * * * root $INSTALL_DIR/scripts/backup.sh
-
-# Backup przyrostowy co 6 godzin
-0 */6 * * * root $INSTALL_DIR/scripts/backup.sh incremental
+    # Konfiguracja harmonogramu backupów
+    cat > /etc/cron.d/ghost-backup << EOF
+0 2 * * * root /usr/local/bin/ghost-backup.sh 2>&1 | logger -t ghost-backup
 EOF
-
+    
     chmod 644 /etc/cron.d/ghost-backup
 }
 
-# Konfiguracja monitoringu bezpieczeństwa
-setup_security_monitoring() {
-    log "Konfiguracja monitoringu bezpieczeństwa..."
+# Funkcja konfigurująca monitoring
+setup_monitoring() {
+    log "INFO" "Konfiguracja monitoringu..."
     
-    # Instalacja i konfiguracja Fail2ban
-    apt-get install -y fail2ban
+    # Instalacja i konfiguracja Prometheus
+    local prom_version="$PROMETHEUS_VERSION"
+    local node_exp_version="$NODE_EXPORTER_VERSION"
     
-    cat > /etc/fail2ban/jail.local <<EOF
+    # Pobieranie i instalacja Prometheus
+    curl -L "https://github.com/prometheus/prometheus/releases/download/v${prom_version}/prometheus-${prom_version}.linux-amd64.tar.gz" | \
+        tar xz -C /tmp/
+    
+    mv "/tmp/prometheus-${prom_version}.linux-amd64/prometheus" /usr/local/bin/
+    mv "/tmp/prometheus-${prom_version}.linux-amd64/promtool" /usr/local/bin/
+    
+    # Konfiguracja Prometheus
+    mkdir -p /etc/prometheus
+    cat > /etc/prometheus/prometheus.yml << EOF
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - localhost:9093
+
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+scrape_configs:
+  - job_name: 'node'
+    static_configs:
+      - targets: ['localhost:9100']
+  
+  - job_name: 'ghost'
+    static_configs:
+      - targets: ['localhost:2368']
+    
+  - job_name: 'nginx'
+    static_configs:
+      - targets: ['localhost:9113']
+    
+  - job_name: 'mysql'
+    static_configs:
+      - targets: ['localhost:9104']
+EOF
+
+    # Reguły alertów
+    mkdir -p /etc/prometheus/rules
+    cat > /etc/prometheus/rules/ghost.yml << EOF
+groups:
+  - name: ghost_alerts
+    rules:
+      - alert: HighCPUUsage
+        expr: rate(process_cpu_seconds_total[5m]) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: High CPU usage on Ghost instance
+          
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes / process_heap_bytes > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: High memory usage on Ghost instance
+          
+      - alert: DiskSpaceLow
+        expr: node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} < 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Low disk space on Ghost server
+EOF
+
+    # Instalacja i konfiguracja Node Exporter
+    curl -L "https://github.com/prometheus/node_exporter/releases/download/v${node_exp_version}/node_exporter-${node_exp_version}.linux-amd64.tar.gz" | \
+        tar xz -C /tmp/
+    
+    mv "/tmp/node_exporter-${node_exp_version}.linux-amd64/node_exporter" /usr/local/bin/
+    
+    # Konfiguracja usług systemd
+    cat > /etc/systemd/system/prometheus.service << EOF
+[Unit]
+Description=Prometheus Monitoring System
+Documentation=https://prometheus.io/docs/introduction/overview/
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/prometheus \
+    --config.file=/etc/prometheus/prometheus.yml \
+    --storage.tsdb.path=/var/lib/prometheus \
+    --web.console.templates=/etc/prometheus/consoles \
+    --web.console.libraries=/etc/prometheus/console_libraries \
+    --web.listen-address=localhost:9090 \
+    --web.external-url=http://localhost:9090 \
+    --storage.tsdb.retention.time=15d \
+    --web.enable-lifecycle
+
+SyslogIdentifier=prometheus
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > /etc/systemd/system/node_exporter.service << EOF
+[Unit]
+Description=Node Exporter
+After=network.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter \
+    --collector.systemd \
+    --collector.processes \
+    --web.listen-address=localhost:9100
+
+SyslogIdentifier=node_exporter
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Tworzenie użytkowników systemowych
+    useradd --no-create-home --shell /bin/false prometheus
+    useradd --no-create-home --shell /bin/false node_exporter
+    
+    # Tworzenie katalogów i ustawianie uprawnień
+    mkdir -p /var/lib/prometheus
+    chown prometheus:prometheus /var/lib/prometheus
+    
+    # AIDE (System monitorowania integralności plików)
+    aideinit
+    mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+    
+    # Konfiguracja automatycznych skanów AIDE
+    cat > /etc/cron.daily/aide-check << 'EOF'
+#!/bin/bash
+aide --check | mailx -s "AIDE Daily Check Report" "${ADMIN_EMAIL}"
+EOF
+    chmod 700 /etc/cron.daily/aide-check
+    
+    # Logwatch
+    cat > /etc/cron.daily/00logwatch << 'EOF'
+#!/bin/bash
+/usr/sbin/logwatch --output mail --mailto "${ADMIN_EMAIL}" --detail high
+EOF
+    chmod 700 /etc/cron.daily/00logwatch
+    
+    # Fail2ban
+    cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
-bantime = 3600
+bantime = 86400
 findtime = 600
-maxretry = 5
+maxretry = 3
+banaction = nftables-multiport
+banaction_allports = nftables-allports
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
 
 [nginx-http-auth]
 enabled = true
 filter = nginx-http-auth
 logpath = /var/log/nginx/error.log
-maxretry = 3
+maxretry = 2
 
 [nginx-botsearch]
 enabled = true
@@ -1331,656 +1302,785 @@ filter = nginx-badbots
 logpath = /var/log/nginx/access.log
 maxretry = 2
 
-[ghost-admin]
+[http-auth]
 enabled = true
-filter = ghost-admin
-logpath = /var/log/nginx/access.log
+filter = apache-auth
+findtime = 300
 maxretry = 3
 EOF
 
-    # Custom filter dla Ghost admin
-    cat > /etc/fail2ban/filter.d/ghost-admin.conf <<EOF
-[Definition]
-failregex = ^<HOST> .* "POST /ghost/api/v3/admin/session" .* 401
-ignoreregex =
-EOF
-
-    # Restart Fail2ban
-    systemctl restart fail2ban
-    
-    # Konfiguracja auditd
-    apt-get install -y auditd
-    
-    cat > /etc/audit/rules.d/ghost.rules <<EOF
-# Monitoring zmian w plikach konfiguracyjnych
--w $INSTALL_DIR/docker-compose.yml -p wa -k ghost_config
--w /etc/nginx/conf.d/ghost.conf -p wa -k ghost_config
--w $MONITORING_DIR -p wa -k ghost_monitoring
-
-# Monitoring dostępu do wrażliwych plików
--w $CREDENTIALS_FILE -p rwa -k ghost_credentials
--w ${CREDENTIALS_FILE}.key -p rwa -k ghost_credentials
-
-# Monitoring prób dostępu do portów
--a exit,always -F arch=b64 -S bind -F a0=0x0.0.0.0 -F key=ghost_ports
-EOF
-
-    # Restart auditd
-    service auditd restart
+    systemctl enable prometheus node_exporter fail2ban
+    systemctl restart prometheus node_exporter fail2ban
 }
 
-# Aktualizacja funkcji setup_auto_updates z obsługą błędów i powiadomieniami
+# Funkcja konfigurująca automatyczne aktualizacje
 setup_auto_updates() {
-    log "Konfiguracja automatycznych aktualizacji..."
+    log "INFO" "Konfiguracja automatycznych aktualizacji..."
     
-    cat > $INSTALL_DIR/scripts/update-ghost.sh <<EOF
-#!/bin/bash
+    cat > /etc/apt/apt.conf.d/50unattended-upgrades << EOF
+Unattended-Upgrade::Allowed-Origins {
+    "\${distro_id}:\${distro_codename}";
+    "\${distro_id}:\${distro_codename}-security";
+    "\${distro_id}ESMApps:\${distro_codename}-apps-security";
+    "\${distro_id}ESM:\${distro_codename}-infra-security";
+};
 
-# Zmienne
-SCRIPT_LOG="$LOG_DIR/update.log"
-CURRENT_VERSION=\$(docker inspect ghost:latest | jq -r '.[0].Id')
-ERROR_COUNT=0
-MAX_RETRIES=3
-UPDATE_LOCK="/var/lock/ghost_update.lock"
+Unattended-Upgrade::Package-Blacklist {
+};
 
-# Funkcja logowania
-update_log() {
-    echo "[\$(date +'%Y-%m-%d %H:%M:%S')] \$1" | tee -a \$SCRIPT_LOG
+Unattended-Upgrade::DevRelease "false";
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::InstallOnShutdown "false";
+Unattended-Upgrade::Mail "${ADMIN_EMAIL}";
+Unattended-Upgrade::MailReport "on-change";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Automatic-Reboot-Time "02:00";
+EOF
+
+    # Konfiguracja apt-listchanges
+    cat > /etc/apt/listchanges.conf << EOF
+[apt]
+frontend=mail
+email_address=${ADMIN_EMAIL}
+confirm=0
+save_seen=/#!/bin/bash
+
+# Strict mode
+set -euo pipefail
+IFS=$'\n\t'
+
+# Script version
+readonly SCRIPT_VERSION="2.0.0"
+
+# Definicje
+readonly GHOST_DIR="/var/www/ghost"
+readonly SECURE_KEY_DIR="/etc/ghost/secure"
+readonly LOG_DIR="/var/log/ghost"
+readonly BACKUP_DIR="/var/backups/ghost"
+readonly TEMP_DIR="/tmp/ghost_install_$$"
+readonly LOCK_DIR="/var/run/ghost"
+readonly REQUIRED_VARS=("DOMAIN" "ADMIN_EMAIL")
+readonly PROMETHEUS_VERSION="2.45.0"
+readonly NODE_EXPORTER_VERSION="1.6.1"
+
+# Zmienne dla kolorowego outputu
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly NC='\033[0m' # No Color
+
+# Funkcja czyszczenia
+cleanup() {
+    log "Czyszczenie zmiennych i plików tymczasowych..."
+    # Czyszczenie wrażliwych zmiennych
+    unset ENCRYPTION_KEY DB_PASS VAULT_TOKEN
+    # Usuwanie plików tymczasowych
+    rm -rf "${TEMP_DIR}"
+    # Usuwanie locka
+    rm -rf "${LOCK_DIR}/ghost_install.lock"
+    # Czyszczenie pozostałych wrażliwych danych z pamięci
+    if command -v dmsetup &> /dev/null; then
+        echo 3 > /proc/sys/vm/drop_caches
+    fi
+}
+trap cleanup EXIT
+trap 'exit 1' SIGINT SIGTERM
+
+# Włączanie trybu verbose jeśli ustawiono
+[[ "${VERBOSE:-0}" == "1" ]] && set -x
+
+# Funkcje logowania
+setup_logging() {
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    readonly LOG_FILE="${LOG_DIR}/install_${timestamp}.log"
+    readonly ERROR_LOG="${LOG_DIR}/error_${timestamp}.log"
+    readonly AUDIT_LOG="${LOG_DIR}/audit_${timestamp}.log"
+    
+    # Tworzenie katalogów z odpowiednimi uprawnieniami
+    install -d -m 750 "${LOG_DIR}"
+    install -d -m 750 "${LOG_DIR}/archive"
+    
+    # Konfiguracja logrotate
+    cat > /etc/logrotate.d/ghost << EOF
+${LOG_DIR}/*.log {
+    daily
+    missingok
+    rotate 30
+    compress
+    delaycompress
+    notifempty
+    create 640 ghost ghost
+    sharedscripts
+    postrotate
+        systemctl reload ghost
+    endscript
+}
+EOF
+    
+    # Przekierowanie wyjścia
+    exec 1> >(tee -a "${LOG_FILE}")
+    exec 2> >(tee -a "${ERROR_LOG}" >&2)
+    
+    # Konfiguracja audytowania
+    auditctl -w "${GHOST_DIR}" -p wa -k ghost_files
+    auditctl -w "${SECURE_KEY_DIR}" -p wa -k ghost_secure
+    
+    log "Rozpoczęcie instalacji Ghost v${SCRIPT_VERSION}"
 }
 
-# Funkcja weryfikacji stanu aplikacji
-check_ghost_health() {
-    local max_attempts=12
-    local attempt=1
-    local wait_time=10
+log() {
+    local level="INFO"
+    if [[ $# -gt 1 ]]; then
+        level="$1"
+        shift
+    fi
     
-    update_log "Sprawdzanie stanu aplikacji..."
+    local color="$NC"
+    case "$level" in
+        "ERROR") color="$RED" ;;
+        "WARN")  color="$YELLOW" ;;
+        "INFO")  color="$GREEN" ;;
+    esac
     
-    while [ \$attempt -le \$max_attempts ]; do
-        if curl -sSf https://$DOMAIN/ghost/api/v3/admin/site/ > /dev/null; then
-            update_log "Aplikacja działa poprawnie"
-            return 0
+    echo -e "${color}[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $*${NC}" | tee -a "${AUDIT_LOG}"
+}
+
+error_log() {
+    log "ERROR" "$*"
+    exit 1
+}
+
+# System blokad
+acquire_lock() {
+    local lock_name="$1"
+    local lock_file="${LOCK_DIR}/${lock_name}.lock"
+    
+    mkdir -p "${LOCK_DIR}"
+    if ! mkdir "${lock_file}" 2>/dev/null; then
+        if [[ -f "${lock_file}/pid" ]]; then
+            local pid
+            pid=$(<"${lock_file}/pid")
+            if kill -0 "$pid" 2>/dev/null; then
+                error_log "Proces $lock_name już działa (PID: $pid)"
+            else
+                log "WARN" "Znaleziono osierocony lock, usuwanie..."
+                rm -rf "${lock_file}"
+                mkdir "${lock_file}"
+            fi
+        fi
+    fi
+    echo $$ > "${lock_file}/pid"
+}
+
+release_lock() {
+    local lock_name="$1"
+    rm -rf "${LOCK_DIR}/${lock_name}.lock"
+}
+
+# Walidacja zmiennych środowiskowych
+validate_environment() {
+    log "INFO" "Sprawdzanie zmiennych środowiskowych..."
+    
+    for var in "${REQUIRED_VARS[@]}"; do
+        if [[ -z "${!var-}" ]]; then
+            error_log "Brak wymaganej zmiennej środowiskowej: $var"
+        fi
+    done
+    
+    # Walidacja formatu zmiennych
+    if ! echo "${ADMIN_EMAIL}" | grep -qE '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'; then
+        error_log "Nieprawidłowy format adresu email: ${ADMIN_EMAIL}"
+    fi
+    
+    if ! echo "${DOMAIN}" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$'; then
+        error_log "Nieprawidłowy format domeny: ${DOMAIN}"
+    fi
+}
+
+# Funkcja sprawdzająca wymagania systemowe
+check_system_requirements() {
+    log "INFO" "Sprawdzanie wymagań systemowych..."
+    
+    # Sprawdzenie czy skrypt jest uruchomiony jako root
+    if [[ $EUID -ne 0 ]]; then
+        error_log "Ten skrypt musi być uruchomiony jako root"
+    fi
+    
+    # Sprawdzenie systemu operacyjnego
+    if [[ ! -f /etc/os-release ]]; then
+        error_log "Nie można określić wersji systemu operacyjnego"
+    fi
+    
+    source /etc/os-release
+    if [[ "${ID}" != "ubuntu" && "${ID}" != "debian" ]]; then
+        error_log "Niewspierany system operacyjny: ${ID}"
+    fi
+    
+    # Sprawdzenie minimalnych wymagań sprzętowych
+    local min_ram=1024000  # 1GB w KB
+    local available_ram
+    available_ram=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+    if ((available_ram < min_ram)); then
+        error_log "Za mało pamięci RAM. Minimum 1GB wymagane."
+    fi
+    
+    # Sprawdzenie miejsca na dysku z uwzględnieniem potrzeb
+    local required_space
+    if [[ -d "${GHOST_DIR}" ]]; then
+        required_space=$(du -s "${GHOST_DIR}" | awk '{print $1 * 3}')  # 3x obecna wielkość
+    else
+        required_space=5242880  # 5GB w KB
+    fi
+    
+    local available_space
+    available_space=$(df / | awk 'NR==2 {print $4}')
+    if ((available_space < required_space)); then
+        error_log "Za mało miejsca na dysku. Wymagane: ${required_space}KB, dostępne: ${available_space}KB"
+    fi
+    
+    # Sprawdzenie wymaganych portów
+    local required_ports=(80 443 2368 9100 9090)
+    for port in "${required_ports[@]}"; do
+        if netstat -tuln | grep -q ":${port} "; then
+            error_log "Port ${port} jest już zajęty"
+        fi
+    done
+    
+    # Sprawdzenie dostępu do internetu
+    if ! curl -s --connect-timeout 5 https://api.github.com >/dev/null; then
+        error_log "Brak dostępu do internetu"
+    fi
+}
+
+# Funkcja instalująca wymagane pakiety
+install_required_packages() {
+    log "INFO" "Instalacja wymaganych pakietów..."
+    
+    # Aktualizacja list pakietów z timeoutem
+    local timeout=300
+    if ! timeout "$timeout" apt-get update; then
+        error_log "Nie można zaktualizować listy pakietów w ciągu ${timeout}s"
+    fi
+    
+    local packages=(
+        curl unzip nginx-extras tar ufw certbot
+        python3-certbot-nginx fail2ban mariadb-server
+        redis-server iptables git build-essential
+        libpcre3 libpcre3-dev zlib1g-dev openssl
+        libssl-dev htop glances lynis cmake golang
+        libunwind-dev libatomic1 ninja-build expect
+        aide logwatch acl vault prometheus
+        auditd apparmor-utils needrestart
+        unattended-upgrades apt-listchanges
+        rkhunter chkrootkit clamav
+        net-tools iproute2 tcpdump
+    )
+    
+    # Instalacja pakietów z progress barem
+    local total=${#packages[@]}
+    local current=0
+    
+    for package in "${packages[@]}"; do
+        current=$((current + 1))
+        local progress=$((current * 100 / total))
+        log "INFO" "[$progress%] Instalacja $package..."
+        
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"; then
+            error_log "Nie można zainstalować pakietu: $package"
+        fi
+    done
+    
+    # Aktualizacja definicji ClamAV
+    freshclam
+}
+
+# Konfiguracja AppArmor
+setup_apparmor() {
+    log "INFO" "Konfiguracja AppArmor..."
+    
+    cat > /etc/apparmor.d/usr.sbin.ghost << EOF
+#include <tunables/global>
+
+profile ghost /usr/sbin/ghost {
+    #include <abstractions/base>
+    #include <abstractions/nameservice>
+    #include <abstractions/openssl>
+    #include <abstractions/ssl_certs>
+    
+    # Ghost directory
+    ${GHOST_DIR}/ r,
+    ${GHOST_DIR}/** rwk,
+    
+    # Config access
+    /etc/ghost/** r,
+    
+    # Logs
+    ${LOG_DIR}/ r,
+    ${LOG_DIR}/** w,
+    
+    # System access
+    /proc/sys/net/core/somaxconn r,
+    /sys/kernel/mm/transparent_hugepage/enabled r,
+    
+    # Node.js
+    /usr/bin/node ix,
+    /usr/lib/node_modules/** mr,
+    
+    # Deny everything else
+    deny /** w,
+}
+EOF
+
+    apparmor_parser -r /etc/apparmor.d/usr.sbin.ghost
+}
+
+# Funkcja konfigurująca bezpieczny system plików
+setup_secure_filesystem() {
+    log "INFO" "Konfiguracja bezpiecznego systemu plików..."
+    
+    # Tworzenie bezpiecznych katalogów
+    local directories=(
+        "$GHOST_DIR"
+        "$SECURE_KEY_DIR"
+        "$BACKUP_DIR"
+        "$TEMP_DIR"
+        "$LOG_DIR"
+        "${GHOST_DIR}/content/data"
+        "${GHOST_DIR}/content/images"
+        "${GHOST_DIR}/content/themes"
+    )
+    
+    for dir in "${directories[@]}"; do
+        if ! install -d -m 0750 "$dir"; then
+            error_log "Nie można utworzyć katalogu: $dir"
+        fi
+    done
+    
+    # Ustawienie dodatkowych zabezpieczeń dla katalogów
+    chmod 1750 "$SECURE_KEY_DIR"  # sticky bit
+    
+    # Konfiguracja ACL
+    local acl_dirs=(
+        "$GHOST_DIR"
+        "${GHOST_DIR}/content"
+        "${GHOST_DIR}/content/data"
+        "${GHOST_DIR}/content/images"
+    )
+    
+    for dir in "${acl_dirs[@]}"; do
+        setfacl -R -m u:ghost:rwx,g:ghost:rx "$dir"
+        setfacl -R -d -m u:ghost:rwx,g:ghost:rx "$dir"
+    done
+    
+    # Zabezpieczenie systemu plików
+    local mount_opts="noexec,nosuid,nodev"
+    
+    # Montowanie /tmp z dodatkowymi opcjami
+    if ! grep -q '/tmp' /etc/fstab; then
+        echo "tmpfs /tmp tmpfs ${mount_opts},size=2G 0 0" >> /etc/fstab
+        mount -o remount /tmp
+    fi
+    
+    # Konfiguracja uprawnień dla wrażliwych plików
+    find "$SECURE_KEY_DIR" -type f -exec chmod 600 {} \;
+    find "$SECURE_KEY_DIR" -type d -exec chmod 700 {} \;
+    
+    # Ustawienie atrybutów immutable dla krytycznych plików
+    local immutable_files=(
+        "/etc/ghost/config.production.json"
+        "${SECURE_KEY_DIR}/ghost.key"
+    )
+    
+    for file in "${immutable_files[@]}"; do
+        if [[ -f "$file" ]]; then
+            chattr +i "$file"
+        fi
+    done
+}
+
+# Konfiguracja Vault
+setup_vault() {
+    log "INFO" "Konfiguracja Vault..."
+    
+    # Generowanie konfiguracji Vault
+    cat > /etc/vault.d/config.hcl << EOF
+storage "file" {
+    path = "/opt/vault/data"
+}
+
+listener "tcp" {
+    address = "127.0.0.1:8200"
+    tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+disable_mlock = true
+
+telemetry {
+    prometheus_retention_time = "30s"
+    disable_hostname = true
+}
+EOF
+
+    # Tworzenie katalogu dla danych Vault
+    install -d -m 0700 /opt/vault/data
+    chown vault:vault /opt/vault/data
+
+    # Uruchomienie Vault
+    systemctl enable vault
+    systemctl start vault
+    
+    # Inicjalizacja Vault
+    local vault_init
+    vault_init=$(vault operator init -key-shares=5 -key-threshold=3 -format=json)
+    
+    # Zapisanie kluczy do zaszyfrowanego pliku
+    local vault_keys_file="${SECURE_KEY_DIR}/vault-keys.enc"
+    echo "$vault_init" | openssl enc -aes-256-cbc -salt -pbkdf2 \
+        -in - -out "$vault_keys_file" -k "${ADMIN_EMAIL}"
+    chmod 600 "$vault_keys_file"
+    
+    # Automatyczne odpieczętowanie Vault
+    local unseal_keys
+    unseal_keys=$(echo "$vault_init" | jq -r '.unseal_keys_b64[]' | head -n 3)
+    while read -r key; do
+        vault operator unseal "$key"
+    done <<< "$unseal_keys"
+    
+    # Logowanie do Vault
+    export VAULT_TOKEN=$(echo "$vault_init" | jq -r '.root_token')
+    
+    # Konfiguracja polityk Vault
+    cat > /etc/vault.d/ghost-policy.hcl << EOF
+path "secret/ghost/*" {
+    capabilities = ["create", "read", "update", "delete", "list"]
+}
+EOF
+    
+    vault policy write ghost-policy /etc/vault.d/ghost-policy.hcl
+}
+
+# Funkcja generująca bezpieczne poświadczenia
+generate_secure_credentials() {
+    log "INFO" "Generowanie bezpiecznych poświadczeń..."
+    
+    # Generowanie losowych wartości z wysoką entropią
+    local db_name
+    local db_user
+    local db_pass
+    local admin_pass
+    local encryption_key
+    
+    db_name=$(tr -dc 'a-z0-9' < /dev/urandom | fold -w 16 | head -n 1)
+    db_user=$(tr -dc 'a-z0-9' < /dev/urandom | fold -w 16 | head -n 1)
+    db_pass=$(openssl rand -base64 48)
+    admin_pass=$(openssl rand -base64 48)
+    encryption_key=$(openssl rand -base64 32)
+    
+    # Zapisywanie poświadczeń do Vault z wersjonowaniem
+    vault kv enable-versioning secret/ghost
+    
+    vault kv put secret/ghost/db \
+        name="$db_name" \
+        user="$db_user" \
+        pass="$db_pass"
+    
+    vault kv put secret/ghost/admin \
+        email="${ADMIN_EMAIL}" \
+        password="$admin_pass"
+        
+    vault kv put secret/ghost/encryption \
+        key="$encryption_key"
+        
+    # Tworzenie polityki rotacji kluczy
+    vault write sys/policies/password/ghost-rotation \
+        policy="length=48 rule='charset: ascii-printable'"
+}
+
+# Funkcja rotacji kluczy
+rotate_encryption_keys() {
+    log "INFO" "Rotacja kluczy szyfrowania..."
+    acquire_lock "key-rotation"
+    
+    local new_key
+    new_key=$(openssl rand -base64 32)
+    local old_key
+    old_key=$(vault kv get -format=json secret/ghost/encryption | jq -r '.data.data.key')
+    
+    # Re-szyfrowanie backupów
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    
+    find "$BACKUP_DIR" -name "*.enc" | while read -r file; do
+        local temp_file="${temp_dir}/$(basename "$file")"
+        
+        # Deszyfrowanie starym kluczem
+        if ! openssl enc -d -aes-256-cbc -salt -pbkdf2 \
+            -pass env:old_key -in "$file" -out "$temp_file"; then
+            log "WARN" "Nie można odszyfrować pliku: $file"
+            continue
         fi
         
-        update_log "Próba \$attempt/\$max_attempts - aplikacja nie odpowiada, czekam \${wait_time}s..."
-        sleep \$wait_time
-        attempt=\$((attempt + 1))
-    done
-    
-    return 1
-}
-
-# Funkcja wykonująca backup przed aktualizacją
-pre_update_backup() {
-    update_log "Wykonywanie backupu przed aktualizacją..."
-    
-    $INSTALL_DIR/scripts/backup.sh pre-update
-    if [ \$? -ne 0 ]; then
-        update_log "BŁĄD: Backup przed aktualizacją nie powiódł się"
-        return 1
-    fi
-    return 0
-}
-
-# Funkcja aktualizacji Ghost
-update_ghost() {
-    update_log "Rozpoczęcie aktualizacji Ghost..."
-    
-    # Backup przed aktualizacją
-    pre_update_backup || return 1
-    
-    # Pobranie najnowszego obrazu
-    update_log "Pobieranie najnowszego obrazu Ghost..."
-    docker pull ghost:latest
-    if [ \$? -ne 0 ]; then
-        update_log "BŁĄD: Nie udało się pobrać najnowszego obrazu"
-        return 1
-    fi
-    
-    # Zapisanie starego i nowego hasha obrazu
-    local old_hash=\$CURRENT_VERSION
-    local new_hash=\$(docker inspect ghost:latest | jq -r '.[0].Id')
-    
-    # Jeśli nie ma zmian w obrazie, kończymy
-    if [ "\$old_hash" = "\$new_hash" ]; then
-        update_log "Brak nowych aktualizacji"
-        return 0
-    fi
-    
-    # Restart z nowym obrazem
-    update_log "Restart Ghost z nowym obrazem..."
-    cd $INSTALL_DIR
-    docker-compose up -d --force-recreate ghost
-    
-    # Sprawdzenie stanu po aktualizacji
-    if ! check_ghost_health; then
-        update_log "BŁĄD: Ghost nie działa poprawnie po aktualizacji"
-        return 1
-    fi
-    
-    # Zapisanie informacji o aktualizacji
-    update_log "Aktualizacja zakończona pomyślnie"
-    echo "\$(date +'%Y-%m-%d %H:%M:%S') \$old_hash -> \$new_hash" >> "$LOG_DIR/update_history.log"
-    
-    return 0
-}
-
-# Funkcja rollback
-perform_rollback() {
-    update_log "Rozpoczęcie procedury rollback..."
-    
-    # Przywrócenie poprzedniej wersji
-    docker tag \$CURRENT_VERSION ghost:latest
-    docker-compose up -d --force-recreate ghost
-    
-    # Sprawdzenie stanu po rollback
-    if check_ghost_health; then
-        update_log "Rollback zakończony pomyślnie"
-        return 0
-    else
-        update_log "BŁĄD: Rollback nie powiódł się"
-        return 1
-    fi
-}
-
-# Funkcja wysyłająca powiadomienia
-send_notification() {
-    local status=\$1
-    local message=\$2
-    
-    # Slack webhook (jeśli skonfigurowany)
-    if [ -n "\$SLACK_WEBHOOK_URL" ]; then
-        curl -X POST -H 'Content-type: application/json' \\
-            --data "{\\"text\\":\\"\$message\\"}" \\
-            \$SLACK_WEBHOOK_URL
-    fi
-    
-    # Email notification
-    if [ -n "\$ADMIN_EMAIL" ]; then
-        echo "\$message" | mail -s "Ghost Update [\$status] - $DOMAIN" \$ADMIN_EMAIL
-    fi
-}
-
-# Główna logika z retries
-main() {
-    # Sprawdzenie czy inny proces aktualizacji nie jest uruchomiony
-    if ! mkdir "\$UPDATE_LOCK" 2>/dev/null; then
-        update_log "BŁĄD: Inny proces aktualizacji jest już uruchomiony"
-        exit 1
-    fi
-    
-    trap 'rm -rf "\$UPDATE_LOCK"' EXIT
-    
-    while [ \$ERROR_COUNT -lt \$MAX_RETRIES ]; do
-        if update_ghost; then
-            send_notification "SUCCESS" "Ghost został pomyślnie zaktualizowany"
-            exit 0
+        # Szyfrowanie nowym kluczem
+        if openssl enc -aes-256-cbc -salt -pbkdf2 \
+            -pass env:new_key -in "$temp_file" -out "${file}.new"; then
+            mv "${file}.new" "$file"
         else
-            ERROR_COUNT=\$((ERROR_COUNT + 1))
-            update_log "Próba aktualizacji \$ERROR_COUNT nie powiodła się"
-            
-            if [ \$ERROR_COUNT -eq \$MAX_RETRIES ]; then
-                update_log "Osiągnięto maksymalną liczbę prób, wykonywanie rollback..."
-                
-                if perform_rollback; then
-                    send_notification "ROLLBACK" "Aktualizacja Ghost nie powiodła się, wykonano rollback"
-                else
-                    send_notification "CRITICAL" "Aktualizacja Ghost nie powiodła się, rollback również nie powiódł się!"
-                fi
-                exit 1
-            fi
-            
-            sleep 60
+            log "ERROR" "Błąd podczas szyfrowania pliku: $file"
+            rm -f "${file}.new"
         fi
     done
+    
+    rm -rf "$temp_dir"
+    
+    # Aktualizacja klucza w Vault
+    vault kv put secret/ghost/encryption key="$new_key"
+    
+    release_lock "key-rotation"
 }
 
-# Rotacja logów
-if [ -f "\$SCRIPT_LOG" ]; then
-    if [ \$(stat -f%z "\$SCRIPT_LOG") -gt 5242880 ]; then # 5MB
-        mv "\$SCRIPT_LOG" "\$SCRIPT_LOG.\$(date +%Y%m%d)"
-        gzip "\$SCRIPT_LOG.\$(date +%Y%m%d)"
+# Funkcja konfigurująca MariaDB
+setup_mariadb() {
+    log "INFO" "Konfiguracja MariaDB..."
+    
+    # Pobieranie poświadczeń z Vault
+    local db_creds
+    db_creds=$(vault kv get -format=json secret/ghost/db)
+    local db_name
+    local db_user
+    local db_pass
+    
+    db_name=$(echo "$db_creds" | jq -r '.data.data.name')
+    db_user=$(echo "$db_creds" | jq -r '.data.data.user')
+    db_pass=$(echo "$db_creds" | jq -r '.data.data.pass')
+    
+    # Konfiguracja zabezpieczeń MariaDB
+    cat > /etc/mysql/conf.d/security.cnf << EOF
+[mysqld]
+# Podstawowe zabezpieczenia
+local-infile=0
+skip-show-database
+sql-mode=STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION,NO_AUTO_CREATE_USER
+symbolic-links=0
+max_allowed_packet=16M
+bind-address=127.0.0.1
+
+# SSL/TLS
+ssl=ON
+ssl-cert=/etc/mysql/server-cert.pem
+ssl-key=/etc/mysql/server-key.pem
+ssl-cipher=TLS_AES_256_GCM_SHA384
+
+# Bezpieczeństwo haseł
+plugin-load-add=simple_password_check.so
+simple_password_check_minimal_length=12
+validate_password_policy=STRONG
+validate_password_length=12
+
+# Logowanie
+log_error=/var/log/mysql/error.log
+log_error_verbosity=3
+slow_query_log=1
+slow_query_log_file=/var/log/mysql/slow.log
+long_query_time=2
+
+# Dodatkowe zabezpieczenia
+secure_file_priv=/var/lib/mysql-files
+explicit_defaults_for_timestamp=1
+EOF
+
+    # Generowanie certyfikatów SSL dla MariaDB
+    local mysql_ssl_dir="/etc/mysql/ssl"
+    mkdir -p "$mysql_ssl_dir"
+    
+    openssl req -new -x509 -nodes -days 365 \
+        -subj "/CN=ghost-mysql/O=Ghost/C=PL" \
+        -keyout "${mysql_ssl_dir}/server-key.pem" \
+        -out "${mysql_ssl_dir}/server-cert.pem"
+        
+    chmod 600 "${mysql_ssl_dir}/server-key.pem"
+    chmod 644 "${mysql_ssl_dir}/server-cert.pem"
+    
+    # Tworzenie bazy i użytkownika
+    mysql -e "CREATE DATABASE IF NOT EXISTS ${db_name} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    mysql -e "CREATE USER IF NOT EXISTS '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';"
+    mysql -e "GRANT ALL PRIVILEGES ON ${db_name}.* TO '${db_user}'@'localhost' REQUIRE SSL;"
+    mysql -e "FLUSH PRIVILEGES;"
+    
+    # Konfiguracja backupów MariaDB
+    cat > /etc/cron.daily/mariadb-backup << EOF
+#!/bin/bash
+set -euo pipefail
+
+backup_dir="${BACKUP_DIR}/mysql"
+date=\$(date +%Y%m%d_%H%M%S)
+mkdir -p "\$backup_dir"
+
+# Backup z kompresją
+mariabackup --backup \\
+    --target-dir="\$backup_dir/full_\${date}" \\
+    --user=root \\
+    --compress \\
+    --compress-threads=4
+
+# Czyszczenie starych backupów
+find "\$backup_dir" -type d -name "full_*" -mtime +7 -exec rm -rf {} +
+EOF
+    chmod 700 /etc/cron.daily/mariadb-backup
+    
+    systemctl restart mariadb
+}
+
+# Funkcja konfigurująca Nginx z HTTP/3
+setup_nginx() {
+    log "INFO" "Konfiguracja Nginx..."
+    
+    # Generowanie silnych parametrów DH
+    if ! [[ -f /etc/nginx/dhparam.pem ]]; then
+        openssl dhparam -out /etc/nginx/dhparam.pem 4096 || {
+            error_log "Nie można wygenerować parametrów DH"
+        }
     fi
-fi
-
-# Uruchomienie głównej funkcji
-main
-EOF
-
-    chmod +x $INSTALL_DIR/scripts/update-ghost.sh
     
-    # Dodanie do crontab
-    cat > /etc/cron.d/ghost-updates <<EOF
-# Aktualizacja w każdą niedzielę o 3:00
-0 3 * * 0 root $INSTALL_DIR/scripts/update-ghost.sh
+    # Konfiguracja HTTP/3
+    cat > /etc/nginx/conf.d/http3.conf << EOF
+# Optymalizacja wydajności
+worker_processes auto;
+worker_rlimit_nofile 65535;
 
-# Sprawdzanie dostępności aktualizacji codziennie
-0 */12 * * * root docker pull ghost:latest > /dev/null 2>&1
-EOF
-
-    chmod 644 /etc/cron.d/ghost-updates
+events {
+    multi_accept on;
+    worker_connections 65535;
 }
 
-# Konfiguracja monitorowania wydajności
-setup_performance_monitoring() {
-    log "Konfiguracja monitorowania wydajności..."
-
-# Kontynuacja konfiguracji monitorowania wydajności
-setup_performance_monitoring() {
-    log "Konfiguracja monitorowania wydajności..."
+# Konfiguracja HTTP
+http {
+    # Podstawowe ustawienia
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    server_tokens off;
     
-    # Konfiguracja Telegraf dla zbierania metryk systemowych
-    cat > $MONITORING_DIR/telegraf/telegraf.conf <<EOF
-[global_tags]
-  environment = "production"
-  service = "ghost"
-
-[agent]
-  interval = "10s"
-  round_interval = true
-  metric_batch_size = 1000
-  metric_buffer_limit = 10000
-  collection_jitter = "0s"
-  flush_interval = "10s"
-  flush_jitter = "0s"
-  precision = ""
-  hostname = "$DOMAIN"
-  omit_hostname = false
-
-[[outputs.prometheus_client]]
-  listen = ":9273"
-  metric_version = 2
-  expiration_interval = "60s"
-
-[[inputs.cpu]]
-  percpu = true
-  totalcpu = true
-  collect_cpu_time = false
-  report_active = false
-
-[[inputs.disk]]
-  ignore_fs = ["tmpfs", "devtmpfs", "devfs", "iso9660", "overlay", "aufs", "squashfs"]
-
-[[inputs.diskio]]
-
-[[inputs.kernel]]
-
-[[inputs.mem]]
-
-[[inputs.processes]]
-
-[[inputs.swap]]
-
-[[inputs.system]]
-
-[[inputs.docker]]
-  endpoint = "unix:///var/run/docker.sock"
-  container_names = []
-  timeout = "5s"
-  perdevice = true
-  total = false
-
-[[inputs.net]]
-  interfaces = ["eth*", "enp*", "ens*"]
-  ignore_protocol_stats = false
-
-[[inputs.nginx]]
-  urls = ["http://localhost/nginx_status"]
-  response_timeout = "5s"
-
-[[inputs.mysql]]
-  servers = ["${DB_USER}:${MYSQL_PASSWORD}@tcp(db:3306)/${DB_NAME}"]
-  metric_version = 2
-
-[[inputs.redis]]
-  servers = ["tcp://redis:6379"]
-  password = "${REDIS_PASSWORD}"
-EOF
-
-    # Konfiguracja własnych dashboardów dla Grafany
-    cat > $MONITORING_DIR/grafana/dashboards/performance.json <<EOF
-{
-  "annotations": {
-    "list": []
-  },
-  "editable": true,
-  "fiscalYearStartMonth": 0,
-  "graphTooltip": 0,
-  "links": [],
-  "liveNow": false,
-  "panels": [
-    {
-      "datasource": "Prometheus",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "lineInterpolation": "smooth",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 0
-      },
-      "id": 1,
-      "options": {
-        "legend": {
-          "calcs": ["mean", "max", "min"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
+    # Limity i bufory
+    client_max_body_size 10M;
+    client_body_buffer_size 128k;
+    client_header_buffer_size 1k;
+    large_client_header_buffers 4 4k;
+    
+    # Buforowanie open_file
+    open_file_cache max=1000 inactive=20s;
+    open_file_cache_valid 30s;
+    open_file_cache_min_uses 2;
+    open_file_cache_errors on;
+    
+    # Rate limiting
+    limit_req_zone \$binary_remote_addr zone=ghost_api:10m rate=10r/s;
+    limit_req_zone \$binary_remote_addr zone=ghost_admin:10m rate=5r/s;
+    
+    # SSL
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:50m;
+    ssl_session_tickets off;
+    
+    # Współczesne konfiguracje SSL
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    
+    # OCSP Stapling
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    resolver 1.1.1.1 1.0.0.1 [2606:4700:4700::1111] [2606:4700:4700::1001] valid=300s;
+    resolver_timeout 5s;
+    
+    # Konfiguracja HSTS
+    add_header Strict-Transport-Security "max-age=63072000" always;
+    
+    server {
+        listen 443 ssl http2;
+        listen [::]:443 ssl http2;
+        listen 443 quic reuseport;
+        listen [::]:443 quic reuseport;
+        
+        server_name ${DOMAIN};
+        
+        # SSL
+        ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+        ssl_trusted_certificate /etc/letsencrypt/live/${DOMAIN}/chain.pem;
+        
+        # HTTP/3
+        add_header Alt-Svc 'h3=":443"; ma=86400' always;
+        
+        # Security headers
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline' 'unsafe-eval'; frame-ancestors 'self';" always;
+        add_header Permissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()";
+        
+        # Cookie security
+        proxy_cookie_path / "/; HttpOnly; Secure; SameSite=strict";
+        
+        # MIME type sniffing
+        add_header X-Content-Type-Options "nosniff" always;
+        
+        # Compression
+        brotli on;
+        brotli_comp_level 6;
+        brotli_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+        
+        # Ghost API rate limiting
+        location /ghost/api/ {
+            limit_req zone=ghost_api burst=20 nodelay;
+            proxy_pass http://127.0.0.1:2368;
         }
-      },
-      "targets": [
-        {
-          "datasource": "Prometheus",
-          "expr": "100 - (avg by (instance) (irate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
-          "legendFormat": "CPU Usage",
-          "refId": "A"
+        
+        # Ghost Admin rate limiting
+        location /ghost/ {
+            limit_req zone=ghost_admin burst=10 nodelay;
+            proxy_pass http://127.0.0.1:2368;
         }
-      ],
-      "title": "CPU Usage",
-      "type": "timeseries"
-    },
-    {
-      "datasource": "Prometheus",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "lineInterpolation": "smooth",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 0
-      },
-      "id": 2,
-      "options": {
-        "legend": {
-          "calcs": ["mean", "max", "min"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
+        
+        # Static files
+        location ~* \.(jpg|jpeg|gif|png|webp|ico|css|js|svg)$ {
+            expires 7d;
+            add_header Cache-Control "public, no-transform";
         }
-      },
-      "targets": [
-        {
-          "datasource": "Prometheus",
-          "expr": "100 * (1 - ((node_memory_MemAvailable_bytes or node_memory_Available_bytes) / node_memory_MemTotal_bytes))",
-          "legendFormat": "Memory Usage",
-          "refId": "A"
+        
+        # Block access to sensitive files
+        location ~ /\. {
+            deny all;
         }
-      ],
-      "title": "Memory Usage",
-      "type": "timeseries"
+        
+        location = /favicon.ico {
+            log_not_found off;
+            access_log off;
+        }
+        
+        location = /robots.txt {
+            allow all;
+            log_not_found off;
+            access_log off;
+        }
+        
+        # Main proxy configuration
+        location / {
+            proxy_pass http://127.0.0.1:2368;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header Host \$http_host;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection "upgrade";
+        }
     }
-  ],
-  "refresh": "5s",
-  "schemaVersion": 38,
-  "style": "dark",
-  "tags": [],
-  "templating": {
-    "list": []
-  },
-  "time": {
-    "from": "now-6h",
-    "to": "now"
-  },
-  "timepicker": {},
-  "timezone": "",
-  "title": "Ghost Performance Dashboard",
-  "uid": "ghost_performance",
-  "version": 1,
-  "weekStart": ""
 }
 EOF
-
-    # Konfiguracja alertów wydajnościowych
-    cat > $MONITORING_DIR/prometheus/rules/performance_alerts.yml <<EOF
-groups:
-- name: performance_alerts
-  rules:
-  - alert: HighCPUUsage
-    expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
-    for: 5m
-    labels:
-      severity: warning
-    annotations:
-      summary: High CPU usage (instance {{ \$labels.instance }})
-      description: CPU usage is above 80%
-      
-  - alert: HighMemoryUsage
-    expr: 100 * (1 - ((node_memory_MemAvailable_bytes or node_memory_Available_bytes) / node_memory_MemTotal_bytes)) > 80
-    for: 5m
-    labels:
-      severity: warning
-    annotations:
-      summary: High memory usage (instance {{ \$labels.instance }})
-      description: Memory usage is above 80%
-      
-  - alert: HighDiskUsage
-    expr: 100 - ((node_filesystem_avail_bytes * 100) / node_filesystem_size_bytes) > 80
-    for: 5m
-    labels:
-      severity: warning
-    annotations:
-      summary: High disk usage (instance {{ \$labels.instance }})
-      description: Disk usage is above 80%
-
-  - alert: SlowResponseTime
-    expr: rate(http_request_duration_seconds_sum[5m]) / rate(http_request_duration_seconds_count[5m]) > 1
-    for: 5m
-    labels:
-      severity: warning
-    annotations:
-      summary: Slow response time (instance {{ \$labels.instance }})
-      description: Average response time is above 1 second
-EOF
-}
-
-# Główna funkcja instalacyjna
-main() {
-    log "Rozpoczęcie instalacji Ghost z rozszerzonymi zabezpieczeniami..."
-    
-    # Sprawdzenie wymagań systemowych
-    check_system_requirements
-    
-    # Sprawdzenie zajętych portów
-    check_ports
-    
-    # Generowanie danych dostępowych
-    generate_secure_credentials
-    
-    # Tworzenie katalogów
-    mkdir -p $INSTALL_DIR/{logs,config,backup,scripts}
-    mkdir -p $MONITORING_DIR/{grafana,prometheus,loki,telegraf}
-    mkdir -p $LOG_DIR
-    
-    # Konfiguracja komponentów
-    setup_nginx
-    setup_grafana
-    setup_prometheus
-    setup_loki
-    setup_docker_compose
-    setup_backup_system
-    setup_auto_updates
-    setup_log_rotation
-    setup_security_monitoring
-    setup_performance_monitoring
-    
-    # Uruchomienie kontenerów
-    cd $INSTALL_DIR
-    docker-compose up -d
-    
-    # Sprawdzenie statusu
-    check_services_status
-    
-    # Konfiguracja firewall
-    setup_firewall
-    
-    # Finalne sprawozdanie
-    log "Instalacja zakończona pomyślnie!"
-    log "Ghost jest dostępny pod adresem: https://$DOMAIN"
-    log "Panel administracyjny: https://$DOMAIN/ghost"
-    log "Grafana: https://$DOMAIN:$GRAFANA_PORT"
-    log "Prometheus: https://$DOMAIN:$PROMETHEUS_PORT"
-    log "Loki: https://$DOMAIN:$LOKI_PORT"
-    log "Dane dostępowe znajdują się w: $CREDENTIALS_FILE"
-    log "WAŻNE: Wykonaj kopię pliku credentials.txt i przechowuj ją w bezpiecznym miejscu!"
-    
-    # Zapisanie podsumowania instalacji
-    cat > "$INSTALL_DIR/installation_summary.txt" <<EOF
-Ghost Installation Summary
-========================
-Date: $(date)
-Domain: $DOMAIN
-Version: $(docker inspect ghost:latest | jq -r '.[0].Config.Labels["org.opencontainers.image.version"]')
-
-Services:
-- Ghost: https://$DOMAIN
-- Admin Panel: https://$DOMAIN/ghost
-- Grafana: https://$DOMAIN:$GRAFANA_PORT
-- Prometheus: https://$DOMAIN:$PROMETHEUS_PORT
-- Loki: https://$DOMAIN:$LOKI_PORT
-
-Backup Schedule:
-- Full backup: Daily at 3:00 AM
-- Incremental backup: Every 6 hours
-
-Security Features:
-- SSL/TLS with auto-renewal
-- Fail2ban protection
-- Network isolation
-- Rate limiting
-- Security monitoring
-- Automated updates
-
-Performance Monitoring:
-- CPU, Memory, Disk usage
-- Database metrics
-- Application metrics
-- Custom alerts
-
-For complete documentation and troubleshooting guide,
-please refer to the documentation in $INSTALL_DIR/docs/
-EOF
-
-    chmod 600 "$INSTALL_DIR/installation_summary.txt"
-}
-
-# Uruchomienie głównej funkcji z obsługą błędów
-{
-    if ! mkdir /var/lock/ghost_install.lock 2>/dev/null; then
-        error "Proces instalacji jest już uruchomiony"
-        exit 1
-    fi
-    
-    trap 'rm -rf /var/lock/ghost_install.lock' EXIT
-    
-    main
-} 2>&1 | tee -a $SCRIPT_LOG
